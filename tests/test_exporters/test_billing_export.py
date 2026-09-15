@@ -161,12 +161,21 @@ class TestPagination:
 
 class TestMetricConstant:
     def test_metric_value_unchanged(self):
-        assert billing_export.COST_METRIC == "BlendedCost"
+        assert billing_export.COST_METRIC == "NetUnblendedCost"
+
+    def test_metric_is_valid_for_operation(self):
+        # Botocore's model documents the valid Metrics values for this op.
+        client = boto3.client("ce", region_name="us-east-1")
+        doc = client.meta.service_model.operation_model("GetCostAndUsage") \
+            .input_shape.members["Metrics"].documentation
+        assert f"<code>{billing_export.COST_METRIC}</code>" in doc
 
     def test_no_stray_metric_literals(self):
         source = (ROOT / "scripts" / "billing_export.py").read_text()
         # Only the constant definition may spell the metric out.
-        assert source.count("'BlendedCost'") + source.count('"BlendedCost"') == 1
+        for metric in ("NetUnblendedCost", "BlendedCost", "UnblendedCost"):
+            quoted = source.count(f"'{metric}'") + source.count(f'"{metric}"')
+            assert quoted == (1 if metric == billing_export.COST_METRIC else 0), metric
 
 
 class TestEndDateExclusive:
@@ -224,12 +233,59 @@ class TestEndDateExclusive:
 
 
 class TestSummaryContract:
+    DATA = {
+        "2026-07": {"Amazon EC2": 10.0},
+        "2026-08": {"Amazon EC2": 150.75, "Amazon S3": 5.75},
+    }
+
+    def _report(self):
+        return billing_export.create_excel_report(
+            self.DATA, "TEST-ACCOUNT", "last-12-months",
+            account_id="123456789012",
+            start_date=datetime.datetime(2026, 7, 1),
+            end_date=datetime.datetime(2026, 9, 1),
+        )
+
+    def test_sheet_order(self, patch_output_dir):
+        wb = load_workbook(self._report())
+        assert wb.sheetnames == ["Summary", "About", "Jul 2026", "Aug 2026"]
+
+    def test_about_sheet(self, patch_output_dir, monkeypatch):
+        monkeypatch.setattr(billing_export.utils, "get_version", lambda: "9.9.9-test")
+        wb = load_workbook(self._report())
+        rows = list(wb["About"].iter_rows(values_only=True))
+        assert rows[0] == ("Field", "Value")
+        about = dict(rows[1:])
+        assert [r[0] for r in rows[1:]] == [
+            "Account ID", "Account Name", "Cost Metric", "Metric Meaning",
+            "Period Start (inclusive)", "Period End (inclusive)", "Generated",
+            "Tool Version", "Data Scope", "Org Caveat", "GovCloud Note",
+        ]
+        assert about["Account ID"] == "123456789012"
+        assert about["Account Name"] == "TEST-ACCOUNT"
+        assert about["Cost Metric"] == "NetUnblendedCost"
+        assert about["Period Start (inclusive)"] == "2026-07-01"
+        assert about["Period End (inclusive)"] == "2026-08-31"
+        assert about["Tool Version"] == "9.9.9-test"
+        for key in ("Metric Meaning", "Generated", "Data Scope", "Org Caveat", "GovCloud Note"):
+            assert about[key]
+
+    def test_month_sheets_unchanged(self, patch_output_dir):
+        wb = load_workbook(self._report())
+        rows = list(wb["Aug 2026"].iter_rows(values_only=True))
+        assert rows[0] == ("Service", "Cost (USD)")
+        assert rows[1] == ("Amazon EC2", pytest.approx(150.75))
+        assert rows[2] == ("Amazon S3", pytest.approx(5.75))
+        assert rows[-1] == ("Total", pytest.approx(156.5))
+
+    def test_month_sheet_names_cannot_be_about(self):
+        for year in (2000, 2026, 2099):
+            for month in range(1, 13):
+                name = datetime.datetime(year, month, 1).strftime("%b %Y")
+                assert name.lower() != billing_export.ABOUT_SHEET.lower()
+
     def test_summary_sheet_shape(self, patch_output_dir):
-        data = {
-            "2026-07": {"Amazon EC2": 10.0},
-            "2026-08": {"Amazon EC2": 150.75, "Amazon S3": 5.75},
-        }
-        path = billing_export.create_excel_report(data, "TEST-ACCOUNT", "last-12-months")
+        path = self._report()
         assert fnmatch.fnmatch(Path(path).name, REAL_EXPORT_GLOB)
 
         wb = load_workbook(path)
@@ -335,3 +391,51 @@ class TestPermissionSkip:
             names = zf.namelist()
         assert names == [Path(found).name]
         assert not any(fnmatch.fnmatch(n, REAL_EXPORT_GLOB) for n in names)
+
+
+class TestGovCloudSkip:
+    def _run_main_govcloud(self, monkeypatch, account_info):
+        utils = billing_export.utils
+        monkeypatch.setattr(utils, "detect_partition", lambda *a, **k: "aws-us-gov")
+        monkeypatch.setattr(utils, "get_account_info", account_info)
+
+        def _no_ce(*a, **k):
+            raise AssertionError("Cost Explorer must not be called in GovCloud")
+
+        monkeypatch.setattr(utils, "get_boto3_client", _no_ce)
+        warnings = []
+        monkeypatch.setattr(utils, "log_warning", lambda msg: warnings.append(msg))
+        with pytest.raises(SystemExit) as exc:
+            billing_export.main()
+        return exc.value.code, warnings
+
+    def _assert_marker(self, out_dir, expected_prefix, expected_account_id):
+        files = list(out_dir.glob("*.xlsx"))
+        assert len(files) == 1
+        marker = files[0]
+        assert marker.name.startswith(f"{expected_prefix}-billing-skipped-govcloud-export-")
+        assert not fnmatch.fnmatch(marker.name, REAL_EXPORT_GLOB)
+        wb = load_workbook(marker)
+        assert wb.sheetnames == ["Skipped"]
+        values = dict(wb["Skipped"].iter_rows(values_only=True))
+        assert values["Status"] == "SKIPPED"
+        assert "aws-us-gov" in values["Reason"]
+        assert "commercial" in values["Reason"]
+        assert values["Account ID"] == expected_account_id
+
+    def test_exit_zero_and_marker(self, monkeypatch, patch_output_dir):
+        code, warnings = self._run_main_govcloud(
+            monkeypatch, lambda: ("123456789012", "GOV-TEST")
+        )
+        assert code == 0
+        assert any("GovCloud" in w for w in warnings)
+        self._assert_marker(patch_output_dir, "GOV-TEST", "123456789012")
+
+    def test_account_lookup_failure_still_exits_zero(self, monkeypatch, patch_output_dir):
+        def _boom():
+            raise RuntimeError("sts unreachable")
+
+        code, warnings = self._run_main_govcloud(monkeypatch, _boom)
+        assert code == 0
+        assert any("sts unreachable" in w for w in warnings)
+        self._assert_marker(patch_output_dir, "UNKNOWN-ACCOUNT", "UNKNOWN")

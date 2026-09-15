@@ -51,13 +51,43 @@ args = utils.parse_script_args("Export AWS billing and cost data to Excel")
 logger = utils.setup_logging('billing-export')
 
 # Cost metric requested from and read back out of Cost Explorer. Both sites
-# must use the same key or every group raises KeyError.
-COST_METRIC = 'BlendedCost'
+# must use the same key or every group raises KeyError. NetUnblendedCost is
+# per-account cost after discounts (not averaged across a consolidated
+# billing family the way BlendedCost is).
+COST_METRIC = 'NetUnblendedCost'
 
-# Permission-skip marker naming. Must never match
-# '*billing-last-12-months-export-*.xlsx' or carry a 'Summary' sheet.
+# Skip-marker naming. Must never match '*billing-last-12-months-export-*.xlsx'
+# or carry a 'Summary' sheet -- downstream readers treat those as spend data.
 SKIP_MARKER_SUFFIX = 'skipped-no-permission'
+GOVCLOUD_SKIP_MARKER_SUFFIX = 'skipped-govcloud'
 SKIP_MARKER_SHEET = 'Skipped'
+
+ABOUT_SHEET = 'About'
+
+# About-sheet wording. Kept to what AWS documents:
+# - NetUnblendedCost: "reflects the cost after discounts" (Cost Explorer
+#   user guide, ce-advanced). The query applies no RECORD_TYPE filter, so
+#   credit/refund line items visible to this account are in the totals.
+# - Member-account visibility of refunds, credits and discounts is a
+#   management-account Cost Explorer preference (user guide, ce-access).
+# - GovCloud usage is billed through, and reported in, the associated
+#   standard account (GovCloud user guide, usage-and-payment).
+METRIC_MEANING = (
+    "Net unblended cost: AWS defines it as the cost after discounts. No record-type "
+    "filter is applied, so credits and refunds visible to this account are included. "
+    "Closest Cost Explorer metric to the amount actually paid."
+)
+DATA_SCOPE = "Costs visible to this account's Cost Explorer only"
+ORG_CAVEAT = (
+    "If this account is an AWS Organizations member, visibility of credits, refunds "
+    "and discounts is controlled by the management account's Cost Explorer "
+    "preferences. If hidden, these figures will not reflect them."
+)
+GOVCLOUD_NOTE = (
+    "GovCloud usage is billed through the associated standard (commercial) account "
+    "and is combined into that account's usage reports. Run from that associated "
+    "account, these figures may include GovCloud spend; it is not separated out here."
+)
 
 
 class BillingPermissionDenied(Exception):
@@ -260,15 +290,21 @@ def get_billing_data(start_date, end_date):
             sys.exit(1)
 
 
-def write_permission_skip_marker(account_name, error_code, error_message):
+def write_skip_marker(account_name, suffix, rows):
     """
-    Write a small workbook recording that billing was skipped for permissions.
+    Write a small workbook recording that the billing export was skipped.
 
-    Billing is a mandatory Smart Scan script, so a missing permission must not
-    fail the run -- but a bare exit 0 with no artifact makes the skip invisible
-    in the zipped audit bundle. The marker uses a distinct suffix and sheet name
-    so nothing that reads real billing exports (sheet 'Summary',
-    '*billing-last-12-months-export-*.xlsx') can mistake it for spend data.
+    Billing is a mandatory Smart Scan script, so a skip must not fail the run
+    -- but a bare exit 0 with no artifact makes the skip invisible in the
+    zipped audit bundle. Markers use a distinct filename suffix and a
+    'Skipped' sheet so nothing that reads real billing exports (sheet
+    'Summary', '*billing-last-12-months-export-*.xlsx') mistakes them for
+    spend data.
+
+    Args:
+        account_name (str): account name for the filename
+        suffix (str): filename suffix, e.g. SKIP_MARKER_SUFFIX
+        rows (list[tuple[str, str]]): (Field, Value) rows after Status
 
     Returns:
         Path: path to the marker workbook
@@ -278,21 +314,15 @@ def write_permission_skip_marker(account_name, error_code, error_message):
     wb = Workbook()
     ws = wb.active
     ws.title = SKIP_MARKER_SHEET
-    rows = [
-        ('Status', 'SKIPPED'),
-        ('Reason', 'Identity lacks Cost Explorer permissions'),
-        ('Error Code', error_code),
-        ('Error Message', error_message),
-        ('Required Permission', 'ce:GetCostAndUsage'),
-        ('Recorded', datetime.datetime.now().strftime('%m.%d.%Y %H:%M:%S')),
-    ]
+    ws.append(('Status', 'SKIPPED'))
     for row in rows:
         ws.append(row)
+    ws.append(('Recorded', datetime.datetime.now().strftime('%m.%d.%Y %H:%M:%S')))
 
     # Always .xlsx: this is an openpyxl workbook, and Smart Scan only
     # attributes/zips *.xlsx outputs.
     filename = utils.create_export_filename(
-        account_name, "billing", SKIP_MARKER_SUFFIX,
+        account_name, "billing", suffix,
         datetime.datetime.now().strftime("%m.%d.%Y"), fmt="xlsx"
     )
     output_path = utils.get_output_filepath(filename)
@@ -301,14 +331,42 @@ def write_permission_skip_marker(account_name, error_code, error_message):
     return output_path
 
 
-def create_excel_report(billing_data, account_name, date_suffix):
+def write_permission_skip_marker(account_name, error_code, error_message):
+    """Marker for an identity lacking Cost Explorer permissions."""
+    return write_skip_marker(account_name, SKIP_MARKER_SUFFIX, [
+        ('Reason', 'Identity lacks Cost Explorer permissions'),
+        ('Error Code', error_code),
+        ('Error Message', error_message),
+        ('Required Permission', 'ce:GetCostAndUsage'),
+    ])
+
+
+def write_govcloud_skip_marker(account_name, account_id):
+    """Marker for a run in the aws-us-gov partition (no Cost Explorer)."""
+    return write_skip_marker(account_name, GOVCLOUD_SKIP_MARKER_SUFFIX, [
+        ('Reason', 'Cost Explorer is unavailable in the aws-us-gov partition. GovCloud '
+                   'usage is billed through the associated standard (commercial) account; '
+                   'run the billing export there.'),
+        ('Account ID', account_id),
+        ('Partition', 'aws-us-gov'),
+    ])
+
+
+def create_excel_report(billing_data, account_name, date_suffix,
+                        account_id=None, start_date=None, end_date=None):
     """
     Create an Excel report with monthly billing data.
+
+    Sheet order: 'Summary' (first, contract unchanged), 'About' (provenance:
+    metric, period, scope caveats), then one sheet per month.
 
     Args:
         billing_data (dict): Billing data organized by month and service
         account_name (str): Name of AWS account for file naming
         date_suffix (str): Date suffix for filename
+        account_id (str): AWS account ID, shown on the About sheet
+        start_date (datetime): Period start (inclusive)
+        end_date (datetime): Period end (exclusive, Cost Explorer contract)
 
     Returns:
         str: Path to the created Excel file
@@ -334,6 +392,10 @@ def create_excel_report(billing_data, account_name, date_suffix):
 
     # Create a summary sheet
     summary_sheet = wb.create_sheet("Summary")
+    # Created now so it sits directly after Summary. Month sheets are named
+    # '%b %Y' (e.g. 'Aug 2026'), which always contains a space and a year, so
+    # they cannot collide with 'About'.
+    about_sheet = wb.create_sheet(ABOUT_SHEET)
     summary_sheet['A1'] = 'Month'
     summary_sheet['B1'] = 'Total Cost (USD)'
 
@@ -405,6 +467,32 @@ def create_excel_report(billing_data, account_name, date_suffix):
         summary_row += 1
         total_all_months += total_cost
 
+    # Provenance sheet
+    about_rows = [
+        ('Account ID', account_id or 'UNKNOWN'),
+        ('Account Name', account_name),
+        ('Cost Metric', COST_METRIC),
+        ('Metric Meaning', METRIC_MEANING),
+        ('Period Start (inclusive)', start_date.strftime('%Y-%m-%d') if start_date else 'N/A'),
+        ('Period End (inclusive)',
+         (end_date - datetime.timedelta(days=1)).strftime('%Y-%m-%d') if end_date else 'N/A'),
+        ('Generated', datetime.datetime.now().strftime('%m.%d.%Y %H:%M:%S')),
+        ('Tool Version', utils.get_version()),
+        ('Data Scope', DATA_SCOPE),
+        ('Org Caveat', ORG_CAVEAT),
+        ('GovCloud Note', GOVCLOUD_NOTE),
+    ]
+    about_sheet['A1'] = 'Field'
+    about_sheet['B1'] = 'Value'
+    for cell in (about_sheet['A1'], about_sheet['B1']):
+        cell.font = header_font
+        cell.fill = header_fill
+    for idx, (field, value) in enumerate(about_rows, start=2):
+        about_sheet[f'A{idx}'] = field
+        about_sheet[f'B{idx}'] = value
+    about_sheet.column_dimensions['A'].width = max(len(f) for f, _ in about_rows) + 2
+    about_sheet.column_dimensions['B'].width = 100
+
     # Add total row to summary
     summary_sheet[f'A{summary_row}'] = 'Total All Months'
     summary_sheet[f'B{summary_row}'] = total_all_months
@@ -450,7 +538,21 @@ def main():
         # Check partition availability
         partition = utils.detect_partition()
         if not utils.is_service_available_in_partition("ce", partition):
-            utils.log_warning("Cost Explorer (billing) is not available in AWS GovCloud. Skipping.")
+            utils.log_warning(
+                "Cost Explorer (billing) is not available in AWS GovCloud. GovCloud usage "
+                "is billed through the associated commercial account. Skipping."
+            )
+            # Account lookup (STS) must not turn a clean skip into a failure.
+            try:
+                gov_account_id, gov_account_name = utils.get_account_info()
+            except Exception as lookup_err:
+                utils.log_warning(f"Could not resolve account for GovCloud skip marker: {lookup_err}")
+                gov_account_id, gov_account_name = "UNKNOWN", "UNKNOWN-ACCOUNT"
+            try:
+                marker_path = write_govcloud_skip_marker(gov_account_name, gov_account_id)
+                utils.log_warning(f"Billing skip recorded in: {marker_path}")
+            except Exception as marker_err:
+                utils.log_warning(f"Could not write billing skip marker: {marker_err}")
             sys.exit(0)
 
         # Print title and get account info
@@ -525,7 +627,10 @@ def main():
             date_suffix = start_date.strftime('%m-%Y')
 
         # Create Excel report
-        output_file = create_excel_report(billing_data, account_name, date_suffix)
+        output_file = create_excel_report(
+            billing_data, account_name, date_suffix,
+            account_id=account_id, start_date=start_date, end_date=end_date,
+        )
 
         print("\nBilling data export completed successfully.")
         print(f"File saved to: {output_file}")
