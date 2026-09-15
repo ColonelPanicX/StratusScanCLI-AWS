@@ -97,6 +97,131 @@ class TestGetRdsInstances:
         assert result == []
 
 
+def _create_postgres(rds, name, **extra):
+    rds.create_db_instance(
+        DBInstanceIdentifier=name,
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+        **extra,
+    )
+
+
+class TestDeploymentColumns:
+    """Status / Multi-AZ / Availability Zone(s) columns, end to end through moto."""
+
+    @mock_aws
+    def test_columns_present_and_placed_after_region(self):
+        rds = boto3.client("rds", region_name=REGION)
+        _create_postgres(rds, "placement-db")
+
+        keys = list(get_rds_instances(REGION)[0].keys())
+        i = keys.index("Region")
+        assert keys[i + 1 : i + 4] == ["Status", "Multi-AZ", "Availability Zone(s)"]
+
+    @mock_aws
+    def test_standalone_single_az(self):
+        rds = boto3.client("rds", region_name=REGION)
+        _create_postgres(rds, "single-az-db")
+        api = rds.describe_db_instances(DBInstanceIdentifier="single-az-db")["DBInstances"][0]
+
+        row = next(r for r in get_rds_instances(REGION) if r["DB Identifier"] == "single-az-db")
+
+        assert row["Status"] == api["DBInstanceStatus"]
+        assert row["Multi-AZ"] == "No"
+        assert row["Availability Zone(s)"] == api["AvailabilityZone"]
+
+    @mock_aws
+    def test_standalone_multi_az_flag(self):
+        rds = boto3.client("rds", region_name=REGION)
+        _create_postgres(rds, "multi-az-db", MultiAZ=True)
+
+        row = next(r for r in get_rds_instances(REGION) if r["DB Identifier"] == "multi-az-db")
+
+        assert row["Multi-AZ"] == "Yes"
+        # moto 5.1.21 does not return SecondaryAvailabilityZone; the standby must
+        # read N/A, not a guessed AZ. The populated case is in TestGetDeploymentFields.
+        assert row["Availability Zone(s)"].endswith("(primary), N/A (standby)")
+
+    @mock_aws
+    def test_aurora_member_uses_cluster_fields(self):
+        rds = boto3.client("rds", region_name=REGION)
+        rds.create_db_cluster(
+            DBClusterIdentifier="aurora-c",
+            Engine="aurora-postgresql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            AvailabilityZones=["us-east-1a", "us-east-1b", "us-east-1c"],
+        )
+        rds.create_db_instance(
+            DBInstanceIdentifier="aurora-c-1",
+            DBInstanceClass="db.r5.large",
+            Engine="aurora-postgresql",
+            DBClusterIdentifier="aurora-c",
+        )
+        cluster = rds.describe_db_clusters(DBClusterIdentifier="aurora-c")["DBClusters"][0]
+        api = rds.describe_db_instances(DBInstanceIdentifier="aurora-c-1")["DBInstances"][0]
+
+        row = next(r for r in get_rds_instances(REGION) if r["DB Identifier"] == "aurora-c-1")
+
+        assert row["Multi-AZ"] == ("Yes" if cluster["MultiAZ"] else "No")
+        assert row["Availability Zone(s)"] == (
+            f"{api['AvailabilityZone']} (this instance); "
+            f"cluster AZs: {', '.join(cluster['AvailabilityZones'])}"
+        )
+
+
+class TestGetDeploymentFields:
+    """Unit tests on crafted API dicts for response shapes moto cannot produce."""
+
+    def test_standalone_multi_az_with_standby_az(self):
+        instance = {
+            "MultiAZ": True,
+            "AvailabilityZone": "us-east-1a",
+            "SecondaryAvailabilityZone": "us-east-1b",
+        }
+        assert rds_export.get_deployment_fields(instance, "N/A", None) == (
+            "Yes",
+            "us-east-1a (primary), us-east-1b (standby)",
+        )
+
+    def test_standalone_missing_fields_are_na(self):
+        # e.g. RDS Custom, where AWS documents instance-level MultiAZ as not applicable.
+        assert rds_export.get_deployment_fields({}, "N/A", None) == ("N/A", "N/A")
+
+    def test_row_with_missing_fields_is_na(self):
+        # No SGs, no subnet group, no cluster: _build_instance_data never touches the client.
+        row = rds_export._build_instance_data(
+            {"DBInstanceIdentifier": "bare"}, REGION, None, {}, {}, "note"
+        )
+        assert row["Status"] == "N/A"
+        assert row["Multi-AZ"] == "N/A"
+        assert row["Availability Zone(s)"] == "N/A"
+
+    def test_cluster_member_ignores_instance_multi_az(self):
+        instance = {"MultiAZ": False, "AvailabilityZone": "us-east-1b"}
+        cluster = {"MultiAZ": True, "AvailabilityZones": ["us-east-1a", "us-east-1b"]}
+        assert rds_export.get_deployment_fields(instance, "c", cluster) == (
+            "Yes",
+            "us-east-1b (this instance); cluster AZs: us-east-1a, us-east-1b",
+        )
+
+    def test_cluster_lookup_failed_is_na(self):
+        instance = {"MultiAZ": False, "AvailabilityZone": "us-east-1b"}
+        assert rds_export.get_deployment_fields(instance, "c", None) == (
+            "N/A",
+            "us-east-1b (this instance); cluster AZs: N/A",
+        )
+
+    def test_cluster_missing_fields_are_na(self):
+        assert rds_export.get_deployment_fields({}, "c", {}) == (
+            "N/A",
+            "N/A (this instance); cluster AZs: N/A",
+        )
+
+
 class TestSilentCollectionFailureRegression:
     """
     Regression tests for the 07.15.2026 audit: RDS data silently lost because a
