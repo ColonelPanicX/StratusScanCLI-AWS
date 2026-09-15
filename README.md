@@ -1,6 +1,6 @@
 # StratusScanCLI-AWS
 
-[![Version: 0.7.0](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/ColonelPanicX/StratusScanCLI-AWS/releases)
+[![Version: 0.7.1](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/ColonelPanicX/StratusScanCLI-AWS/releases)
 [![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#project-status)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
@@ -388,7 +388,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the exporter script template and cont
 
 ## Project Status
 
-**Current version: 0.7.0-beta**
+**Current version: 0.7.1-beta**
 
 StratusScanCLI-AWS is in active beta development. The API and output format may change before the 1.0.0 stable release. All active development occurs on the `dev` branch; `main` is release snapshots only.
 
