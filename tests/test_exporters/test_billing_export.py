@@ -85,6 +85,27 @@ def _base_request(start, end):
     }
 
 
+def _months_in(start, end):
+    """'YYYY-MM' keys for every calendar month in [start, end)."""
+    months = []
+    y, m = start.year, start.month
+    while datetime.datetime(y, m, 1) < end:
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return months
+
+
+def _frozen_now(fixed):
+    """Patch billing_export's datetime.datetime.now() to a fixed instant."""
+
+    class FakeDT(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    return patch.object(billing_export.datetime, "datetime", FakeDT)
+
+
 class TestPagination:
     def test_follows_next_page_token_and_sums_split_groups(self, monkeypatch):
         _, stubber = _stubbed_ce(monkeypatch)
@@ -194,9 +215,39 @@ class TestEndDateExclusive:
         today = datetime.datetime.now()
         _, _, start, end = billing_export.validate_date_input("last 12")
         assert end == datetime.datetime(today.year, today.month, 1)
-        last_month = end - datetime.timedelta(days=1)
-        # Start unchanged from prior behavior
-        assert start == datetime.datetime(last_month.year - 1, last_month.month, 1)
+        assert start == datetime.datetime(today.year - 1, today.month, 1)
+        assert len(_months_in(start, end)) == 12
+
+    @pytest.mark.parametrize("now, exp_start, exp_end, first, last", [
+        # mid-month
+        (datetime.datetime(2026, 9, 15, 10, 0), datetime.datetime(2025, 9, 1),
+         datetime.datetime(2026, 9, 1), "2025-09", "2026-08"),
+        # 1st of the month, just after midnight
+        (datetime.datetime(2026, 9, 1, 0, 5), datetime.datetime(2025, 9, 1),
+         datetime.datetime(2026, 9, 1), "2025-09", "2026-08"),
+        # January: window is the whole previous calendar year
+        (datetime.datetime(2026, 1, 20, 9, 0), datetime.datetime(2025, 1, 1),
+         datetime.datetime(2026, 1, 1), "2025-01", "2025-12"),
+        # January 1st
+        (datetime.datetime(2026, 1, 1, 0, 1), datetime.datetime(2025, 1, 1),
+         datetime.datetime(2026, 1, 1), "2025-01", "2025-12"),
+        # February: previous month is January of the same year
+        (datetime.datetime(2026, 2, 1, 12, 0), datetime.datetime(2025, 2, 1),
+         datetime.datetime(2026, 2, 1), "2025-02", "2026-01"),
+    ])
+    def test_last_12_is_exactly_12_months_and_passes_retention(
+        self, now, exp_start, exp_end, first, last
+    ):
+        with _frozen_now(now):
+            ok, _, start, end = billing_export.validate_date_input("last 12")
+            valid, message, retention = billing_export.validate_date_range(start, end)
+        assert ok
+        assert (start, end) == (exp_start, exp_end)
+        months = _months_in(start, end)
+        assert len(months) == 12
+        assert months[0] == first and months[-1] == last
+        assert retention == 14
+        assert valid, message
 
     def test_previous_month_valid_on_first_of_month(self):
         fake_now = datetime.datetime(2026, 9, 1, 0, 30)
@@ -439,3 +490,56 @@ class TestGovCloudSkip:
         assert code == 0
         assert any("sts unreachable" in w for w in warnings)
         self._assert_marker(patch_output_dir, "UNKNOWN-ACCOUNT", "UNKNOWN")
+
+
+class TestTwelveMonthReport:
+    """End-to-end: 'last 12' request -> 12 month keys, sheets and Summary rows."""
+
+    def test_last_12_report_has_exactly_12_months(self, monkeypatch, patch_output_dir):
+        client, stubber = _stubbed_ce(monkeypatch)
+        with _frozen_now(datetime.datetime(2026, 1, 1, 0, 1)):
+            _, _, start, end = billing_export.validate_date_input("last 12")
+        months = _months_in(start, end)
+
+        results = []
+        for key in months:
+            y, m = int(key[:4]), int(key[5:])
+            nxt = datetime.datetime(y + 1, 1, 1) if m == 12 else datetime.datetime(y, m + 1, 1)
+            results.append(_result(f"{key}-01", nxt.strftime("%Y-%m-%d"),
+                                   [_group("Amazon EC2", "1.00")]))
+        # Split across two pages to exercise the loop on the real window.
+        stubber.add_response(
+            "get_cost_and_usage",
+            {"ResultsByTime": results[:7], "NextPageToken": "p2"},
+            _base_request("2025-01-01", "2026-01-01"),
+        )
+        stubber.add_response(
+            "get_cost_and_usage",
+            {"ResultsByTime": results[7:]},
+            {**_base_request("2025-01-01", "2026-01-01"), "NextPageToken": "p2"},
+        )
+        with stubber:
+            data = billing_export.get_billing_data(start, end)
+            stubber.assert_no_pending_responses()
+        assert sorted(data) == months and len(data) == 12
+
+        path = billing_export.create_excel_report(
+            data, "TEST-ACCOUNT", "last-12-months",
+            account_id="123456789012", start_date=start, end_date=end,
+        )
+        wb = load_workbook(path)
+        month_sheets = wb.sheetnames[2:]
+        assert wb.sheetnames[:2] == ["Summary", "About"]
+        assert len(month_sheets) == 12
+        assert month_sheets[0] == "Jan 2025" and month_sheets[-1] == "Dec 2025"
+
+        rows = list(wb["Summary"].iter_rows(values_only=True))
+        assert rows[0] == ("Month", "Total Cost (USD)")
+        assert len(rows) == 1 + 12 + 1
+        assert rows[1][0] == "January 2025" and rows[12][0] == "December 2025"
+        assert rows[-1][0] == "Total All Months"
+        assert rows[-1][1] == pytest.approx(12.0)
+
+        about = dict(list(wb["About"].iter_rows(values_only=True))[1:])
+        assert about["Period Start (inclusive)"] == "2025-01-01"
+        assert about["Period End (inclusive)"] == "2025-12-31"

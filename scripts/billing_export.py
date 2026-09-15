@@ -116,13 +116,14 @@ def validate_date_input(date_input):
     last_12_pattern = r'^last\s*12$'  # "last 12" with flexible spacing
 
     if re.match(last_12_pattern, date_input.lower()):
-        # Last 12 months
+        # Last 12 complete calendar months, excluding the current month.
         today = datetime.datetime.now()
         # Cost Explorer TimePeriod.End is exclusive: first day of the current
         # month covers the previous month through its final day.
         end_date = datetime.datetime(today.year, today.month, 1)
-        last_month = end_date - datetime.timedelta(days=1)
-        start_date = datetime.datetime(last_month.year - 1, last_month.month, 1)
+        # Same month one year earlier: [start, end) spans exactly 12 months
+        # (e.g. run 2026-09-15 -> 2025-09-01 .. 2026-09-01 = Sep 2025..Aug 2026).
+        start_date = datetime.datetime(end_date.year - 1, end_date.month, 1)
         return True, False, start_date, end_date
 
     elif re.match(month_year_pattern, date_input):
