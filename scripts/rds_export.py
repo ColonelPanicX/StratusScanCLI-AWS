@@ -335,14 +335,15 @@ def get_deployment_fields(instance, db_cluster_id, cluster):
     Multi-AZ standby.
 
     Cluster members (Aurora, Neptune, DocumentDB, and non-Aurora Multi-AZ DB
-    clusters) do not use instance-level ``MultiAZ`` — AWS documents it as not
-    applicable to Aurora — so Multi-AZ comes from the cluster's ``MultiAZ``
-    ("has instances in multiple Availability Zones"). The cluster's
-    ``AvailabilityZones`` list is where instances *can* be created, not where
-    they run, so it is labelled separately from this member's own
-    ``AvailabilityZone``. ``cluster`` is the DBCluster dict already fetched for
-    the Role column; when that lookup failed it is None and the cluster-derived
-    parts are 'N/A'. No extra API call is made here.
+    clusters) do not use instance-level ``MultiAZ`` — CreateDBInstance documents
+    it as not applying to Aurora because instance AZs are managed by the DB
+    cluster — so Multi-AZ comes from the cluster's ``MultiAZ`` ("has instances
+    in multiple Availability Zones"). Availability Zone(s) is this member's own
+    ``AvailabilityZone`` only. The cluster's ``AvailabilityZones`` list is
+    deliberately not exported: it is where instances *can* be created, not
+    where they run. ``cluster`` is the DBCluster dict already fetched for the
+    Role column; when that lookup failed it is None and Multi-AZ is 'N/A'
+    (the AZ still comes from the instance). No extra API call is made here.
 
     Args:
         instance (dict): A DBInstances entry from describe_db_instances.
@@ -356,13 +357,8 @@ def get_deployment_fields(instance, db_cluster_id, cluster):
 
     if db_cluster_id != 'N/A':
         if cluster is None:
-            return 'N/A', f"{primary_az} (this instance); cluster AZs: N/A"
-        cluster_azs = cluster.get('AvailabilityZones') or []
-        cluster_azs_text = ", ".join(cluster_azs) if cluster_azs else 'N/A'
-        return (
-            _yes_no_or_na(cluster.get('MultiAZ')),
-            f"{primary_az} (this instance); cluster AZs: {cluster_azs_text}",
-        )
+            return 'N/A', primary_az
+        return _yes_no_or_na(cluster.get('MultiAZ')), primary_az
 
     multi_az = _yes_no_or_na(instance.get('MultiAZ'))
     secondary_az = instance.get('SecondaryAvailabilityZone')

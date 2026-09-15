@@ -167,10 +167,8 @@ class TestDeploymentColumns:
         row = next(r for r in get_rds_instances(REGION) if r["DB Identifier"] == "aurora-c-1")
 
         assert row["Multi-AZ"] == ("Yes" if cluster["MultiAZ"] else "No")
-        assert row["Availability Zone(s)"] == (
-            f"{api['AvailabilityZone']} (this instance); "
-            f"cluster AZs: {', '.join(cluster['AvailabilityZones'])}"
-        )
+        # Only the member's own AZ; the cluster's AvailabilityZones list is not exported.
+        assert row["Availability Zone(s)"] == api["AvailabilityZone"]
 
 
 class TestGetDeploymentFields:
@@ -202,24 +200,15 @@ class TestGetDeploymentFields:
 
     def test_cluster_member_ignores_instance_multi_az(self):
         instance = {"MultiAZ": False, "AvailabilityZone": "us-east-1b"}
-        cluster = {"MultiAZ": True, "AvailabilityZones": ["us-east-1a", "us-east-1b"]}
-        assert rds_export.get_deployment_fields(instance, "c", cluster) == (
-            "Yes",
-            "us-east-1b (this instance); cluster AZs: us-east-1a, us-east-1b",
-        )
+        cluster = {"MultiAZ": True, "AvailabilityZones": ["us-east-1a", "us-east-1c"]}
+        assert rds_export.get_deployment_fields(instance, "c", cluster) == ("Yes", "us-east-1b")
 
-    def test_cluster_lookup_failed_is_na(self):
+    def test_cluster_lookup_failed_multi_az_na_az_from_instance(self):
         instance = {"MultiAZ": False, "AvailabilityZone": "us-east-1b"}
-        assert rds_export.get_deployment_fields(instance, "c", None) == (
-            "N/A",
-            "us-east-1b (this instance); cluster AZs: N/A",
-        )
+        assert rds_export.get_deployment_fields(instance, "c", None) == ("N/A", "us-east-1b")
 
     def test_cluster_missing_fields_are_na(self):
-        assert rds_export.get_deployment_fields({}, "c", {}) == (
-            "N/A",
-            "N/A (this instance); cluster AZs: N/A",
-        )
+        assert rds_export.get_deployment_fields({}, "c", {}) == ("N/A", "N/A")
 
 
 class TestSilentCollectionFailureRegression:
