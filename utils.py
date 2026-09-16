@@ -5140,3 +5140,20 @@ def resume_scan_session(session: dict) -> None:
     session["status"] = "running"
     session["completed_at"] = None
     _write_scan_session(session)
+
+
+def update_scan_session(session: dict, **fields) -> None:
+    """
+    Merge arbitrary metadata into a session and persist it.
+
+    Used by callers that need context to survive an interruption — the regions
+    scanned, the discovered service list, the account the run targeted — so a
+    resumed run can still produce a complete report. Keys beginning with an
+    underscore stay in-memory only (see ``_write_scan_session``).
+
+    Args:
+        session: Session dict from start_scan_session()
+        **fields: Metadata keys to set on the session
+    """
+    session.update(fields)
+    _write_scan_session(session)
