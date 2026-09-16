@@ -11,7 +11,8 @@ Date: NOV-15-2025
 Description:
 This script exports a list of all RDS instances across available AWS
 regions into a spreadsheet. The export includes DB Identifier, DB Cluster
-Identifier, Role, Engine, Engine Version, RDS Extended Support, Region, Size,
+Identifier, Role, Engine, Engine Version, RDS Extended Support, Region, Status,
+Multi-AZ, Availability Zone(s), Size,
 Storage Type, Storage, Provisioned IOPS, Port, Endpoint, Master Username, VPC
 (Name and ID), Subnet IDs, Security Groups (Name and ID), DB Subnet Group Name,
 DB Certificate Expiry, Created Time, and Encryption information.
@@ -312,6 +313,64 @@ def calculate_rds_storage_cost(storage_size, storage_type, storage_pricing):
         utils.log_warning(f"Error calculating storage cost: {e}")
         return 'N/A'
 
+def _yes_no_or_na(value):
+    """Map an API boolean to Yes/No; anything else (absent, None) is 'N/A', never guessed."""
+    if value is True:
+        return 'Yes'
+    if value is False:
+        return 'No'
+    return 'N/A'
+
+
+def get_deployment_fields(instance, db_cluster_id, cluster):
+    """
+    Derive the 'Multi-AZ' and 'Availability Zone(s)' export values for one instance.
+
+    Every value is read straight from the API response; a field the API did not
+    return is reported as 'N/A' rather than inferred from other fields.
+
+    Standalone instances (no DBClusterIdentifier) use the instance-level
+    ``MultiAZ``, ``AvailabilityZone`` and ``SecondaryAvailabilityZone`` fields
+    (DescribeDBInstances / DBInstance data type). The secondary AZ is the
+    Multi-AZ standby.
+
+    Cluster members (Aurora, Neptune, DocumentDB, and non-Aurora Multi-AZ DB
+    clusters) do not use instance-level ``MultiAZ`` — CreateDBInstance documents
+    it as not applying to Aurora because instance AZs are managed by the DB
+    cluster — so Multi-AZ comes from the cluster's ``MultiAZ`` ("has instances
+    in multiple Availability Zones"). Availability Zone(s) is this member's own
+    ``AvailabilityZone`` only. The cluster's ``AvailabilityZones`` list is
+    deliberately not exported: it is where instances *can* be created, not
+    where they run. ``cluster`` is the DBCluster dict already fetched for the
+    Role column; when that lookup failed it is None and Multi-AZ is 'N/A'
+    (the AZ still comes from the instance). No extra API call is made here.
+
+    Args:
+        instance (dict): A DBInstances entry from describe_db_instances.
+        db_cluster_id (str): The instance's DBClusterIdentifier, or 'N/A'.
+        cluster (dict | None): The matching DBClusters entry, if fetched.
+
+    Returns:
+        tuple[str, str]: (multi_az, availability_zones)
+    """
+    primary_az = instance.get('AvailabilityZone') or 'N/A'
+
+    if db_cluster_id != 'N/A':
+        if cluster is None:
+            return 'N/A', primary_az
+        return _yes_no_or_na(cluster.get('MultiAZ')), primary_az
+
+    multi_az = _yes_no_or_na(instance.get('MultiAZ'))
+    secondary_az = instance.get('SecondaryAvailabilityZone')
+
+    if secondary_az:
+        return multi_az, f"{primary_az} (primary), {secondary_az} (standby)"
+    if multi_az == 'Yes':
+        # Multi-AZ but no standby AZ in the response: say so rather than guess one.
+        return multi_az, f"{primary_az} (primary), N/A (standby)"
+    return multi_az, primary_az
+
+
 def _build_instance_data(instance, region, rds_client, pricing_data, storage_pricing, cost_note):
     """
     Build the export row for a single RDS instance.
@@ -358,6 +417,8 @@ def _build_instance_data(instance, region, rds_client, pricing_data, storage_pri
     # Determine if instance is part of a cluster and its role
     db_cluster_id = instance.get('DBClusterIdentifier', 'N/A')
     role = 'Standalone'
+    # Kept so the deployment columns can reuse the one lookup already made here.
+    cluster = None
     if db_cluster_id != 'N/A':
         try:
             # Get cluster info to determine if this instance is primary or replica
@@ -374,6 +435,8 @@ def _build_instance_data(instance, region, rds_client, pricing_data, storage_pri
         except Exception as e:
             # If we can't determine cluster role, leave as default
             utils.log_warning(f"Could not determine cluster role for {instance_id}: {e}")
+
+    multi_az, availability_zones = get_deployment_fields(instance, db_cluster_id, cluster)
 
     # Check for RDS Extended Support status
     extended_support = 'No'
@@ -437,6 +500,9 @@ def _build_instance_data(instance, region, rds_client, pricing_data, storage_pri
         'Engine Version': engine_version,
         'RDS Extended Support': extended_support,
         'Region': region,
+        'Status': instance.get('DBInstanceStatus', 'N/A'),
+        'Multi-AZ': multi_az,
+        'Availability Zone(s)': availability_zones,
         'Size': instance_class,
         'Monthly Cost (On-Demand)': monthly_cost,
         'Monthly Storage Cost': storage_cost,
