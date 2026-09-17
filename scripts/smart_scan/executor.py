@@ -514,7 +514,9 @@ class ScriptExecutor:
             result = self._execute_script(script_path)
             self.results.append(result)
 
-            # Persist result to session file
+            # Persist result to session file. output_file travels with the record
+            # so a resumed session can archive every run's outputs, not just the
+            # last one (issue #291).
             if session is not None:
                 status_str = "success" if result.success else "failed"
                 utils.record_scan_result(
@@ -524,6 +526,7 @@ class ScriptExecutor:
                     result.return_code,
                     result.duration_seconds,
                     script=script_name,
+                    output_file=result.output_file,
                 )
 
             # Brief pause between scripts
