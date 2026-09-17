@@ -4589,6 +4589,20 @@ def _pricing_settings() -> dict[str, Any]:
         logging.getLogger(__name__).warning(
             "Could not read pricing advanced settings (%s) - using defaults", exc
         )
+
+    # Environment override, for air-gapped runs, CI, and any context where
+    # reaching a public endpoint is not acceptable and editing config.json is
+    # not convenient. The env var wins over config.json deliberately: it is the
+    # lever an operator reaches for when a network call must not happen.
+    override = os.environ.get("STRATUSSCAN_PRICING_LIVE_FEED")
+    if override is not None:
+        defaults["live_feed_enabled"] = override.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        )
     return defaults
 
 

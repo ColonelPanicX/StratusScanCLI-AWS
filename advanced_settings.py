@@ -61,9 +61,10 @@ def get_default_settings():
             # feed is never served from a stale entry regardless of this value.
             'cache_ttl_hours': 168,
             # The feed host serves no compression, so this is literal wire
-            # bytes. 384 MiB clears the 302,856,576-byte us-east-1 EC2 CSV plus
-            # the 205,737,309-byte us-gov-west-1 one when summed per offer.
-            'max_feed_bytes': 402653184,
+            # bytes, and it is checked against the sum across Regions. 640 MiB
+            # clears AmazonEC2's 508,593,885-byte total (302,856,576 us-east-1
+            # plus 205,737,309 us-gov-west-1).
+            'max_feed_bytes': 671088640,
             'timeout_seconds': 30,
             # Hard wall-clock budget. Past this the fetch is abandoned and the
             # bundled snapshot is used.

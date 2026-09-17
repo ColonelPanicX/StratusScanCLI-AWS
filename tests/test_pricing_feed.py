@@ -32,11 +32,6 @@ REFERENCE_FILE = Path(__file__).parent.parent / "reference" / "ec2-pricing.json"
 #: data drifts far.
 MAX_SNAPSHOT_AGE_DAYS = 180
 
-#: AWS's real Windows license adder, per vCPU-hour. The current bundled file
-#: was built by adding this to a wrong Linux base for every record, which is
-#: how #296 proved the block had been computed rather than retrieved.
-WINDOWS_LICENSE_PER_VCPU_HOUR = 0.046
-
 
 @pytest.fixture(scope="module")
 def snapshot() -> dict:
@@ -88,41 +83,19 @@ class TestBundledProvenance:
 
 class TestNoSynthesizedValues:
     """
-    The three fingerprints of synthesis that #296 identified.
+    Offline checks against the shapes of the defects #296 found.
 
-    These are cheap offline smoke tests, not a substitute for the feed
-    agreement test below. A family that is uniformly wrong passes all of them.
+    These are cheap smoke tests, not a substitute for the feed agreement test
+    below. A family that is uniformly wrong passes all of them.
+
+    One candidate check was dropped after being measured rather than assumed.
+    The #296 audit treated a Windows-minus-Linux delta of exactly
+    $0.046/vCPU-hr as proof that Windows had been computed from Linux. In the
+    authoritative feed that relationship holds for 856 of 948 comparable
+    us-east-1 records -- 90% -- because it is how AWS actually prices the
+    Windows license. It is a true fact about AWS pricing, so it distinguishes
+    nothing, and a test asserting otherwise would assert something false.
     """
-
-    def test_windows_is_not_linux_plus_a_license_formula(self, snapshot):
-        """
-        Windows must be the published Windows rate.
-
-        In the pre-#297 file the Windows-minus-Linux delta was exactly
-        $0.046 x vCPU for every record carrying both -- a license formula
-        layered on a Linux base, not a retrieved price.
-        """
-        formula_matches = 0
-        comparable = 0
-        for _instance_type, record in snapshot["records"].items():
-            vcpu = record.get("vcpu")
-            block = (record.get("pricing") or {}).get("us-east-1") or {}
-            linux = block.get("linux_on_demand_monthly_usd")
-            windows = block.get("windows_on_demand_monthly_usd")
-            if not vcpu or linux is None or windows is None:
-                continue
-            comparable += 1
-            expected = WINDOWS_LICENSE_PER_VCPU_HOUR * vcpu * pricing_feed.HOURS_PER_MONTH
-            if abs((windows - linux) - expected) < 0.02:
-                formula_matches += 1
-
-        assert comparable > 0, "no records carry both Linux and Windows rates"
-        ratio = formula_matches / comparable
-        assert ratio < 0.5, (
-            f"{formula_matches}/{comparable} ({ratio:.0%}) of Windows rates equal "
-            f"Linux + ${WINDOWS_LICENSE_PER_VCPU_HOUR}/vCPU-hr exactly. That is a "
-            f"computed license adder, not a retrieved Windows price."
-        )
 
     @pytest.mark.parametrize(
         ("instance_type", "vcpu", "memory_gib"),
@@ -456,6 +429,7 @@ def _ec2_row(
 ) -> dict:
     return {
         "TermType": term,
+        "MarketOption": "OnDemand",
         "Product Family": "Compute Instance",
         "Tenancy": tenancy,
         "CapacityStatus": capacity,

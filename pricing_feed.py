@@ -74,7 +74,11 @@ SCHEMA_VERSION = "3.0.0"
 # Defaults mirrored in advanced_settings.get_default_settings()['pricing'].
 DEFAULT_LIVE_FEED_ENABLED = True
 DEFAULT_CACHE_TTL_HOURS = 168  # 7 days
-DEFAULT_MAX_FEED_BYTES = 402653184  # 384 MiB -- above the 302 MB EC2 us-east-1 CSV
+# 640 MiB. The ceiling is checked against the SUM across Regions, and
+# AmazonEC2 totals 508,593,885 bytes (302,856,576 us-east-1 +
+# 205,737,309 us-gov-west-1), so a smaller value silently disables the live
+# path for the one offer this is built for.
+DEFAULT_MAX_FEED_BYTES = 671088640
 DEFAULT_TIMEOUT_SECONDS = 30  # per-socket connect/read timeout
 DEFAULT_MAX_SECONDS = 180  # hard wall-clock budget for one offer's fetch
 
@@ -303,6 +307,11 @@ EC2_PRODUCT_FAMILIES = ("Compute Instance", "Compute Instance (bare metal)")
 #: base rates and are not.
 EC2_ONDEMAND_FILTERS: dict[str, str] = {
     "TermType": "OnDemand",
+    # Capacity Block rows (operation RunInstances:CB) are also TermType
+    # OnDemand and carry a $0.00 PricePerUnit. Without this filter they shadow
+    # the real rate on exactly the instances where it matters most:
+    # p6-b200.48xlarge would export at $0.00/month instead of $83,169.
+    "MarketOption": "OnDemand",
     "Tenancy": "Shared",
     "CapacityStatus": "Used",
     "Pre Installed S/W": "NA",
@@ -417,6 +426,18 @@ def extract_ec2_records(
         hourly = _parse_price(row.get("PricePerUnit"))
         if hourly is None:
             continue
+        if hourly <= 0:
+            # No compute instance is free. A zero here is a promotional,
+            # capacity-reservation or placeholder row, and writing it would
+            # report an expensive instance as costing nothing -- the one
+            # failure mode worse than overstating cost.
+            _LOG.debug(
+                "Ignoring zero-price row for %s (%s, operation=%s)",
+                instance_type,
+                operating_system,
+                row.get("operation"),
+            )
+            continue
 
         record = records.setdefault(
             instance_type,
@@ -457,11 +478,32 @@ def extract_ec2_records(
 
         monthly = round(hourly * HOURS_PER_MONTH, 2)
         if is_ondemand and operating_system == "Linux":
-            block["linux_on_demand_monthly_usd"] = monthly
+            field = "linux_on_demand_monthly_usd"
         elif is_ondemand and operating_system == "Windows":
-            block["windows_on_demand_monthly_usd"] = monthly
+            field = "windows_on_demand_monthly_usd"
         elif is_reserved and operating_system == "Linux":
-            block["linux_reserved_1yr_monthly_usd"] = monthly
+            field = "linux_reserved_1yr_monthly_usd"
+        else:
+            continue
+
+        existing = block[field]
+        if existing is None:
+            block[field] = monthly
+        elif existing != monthly:
+            # Two rows passed the same filter set with different prices, so the
+            # filters do not pin a single SKU. Keeping the first is arbitrary,
+            # which is exactly why it is logged rather than done quietly --
+            # "last row wins" is how a Capacity Block row at $0.00 came to
+            # shadow a real rate.
+            _LOG.warning(
+                "Ambiguous %s for %s in %s: keeping %s, also saw %s (operation=%s)",
+                field,
+                instance_type,
+                region_key,
+                existing,
+                monthly,
+                row.get("operation"),
+            )
 
     return records
 
