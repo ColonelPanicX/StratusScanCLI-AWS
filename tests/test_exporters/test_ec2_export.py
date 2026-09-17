@@ -145,3 +145,138 @@ class TestSilentCollectionFailureRegression:
 
         with pytest.raises(botocore.exceptions.ClientError):
             get_instance_data(REGION)
+
+
+# ---------------------------------------------------------------------------
+# vCPU sourcing (Issue #259)
+#
+# The vCPU column read CpuOptions.CoreCount, which is *physical cores*. On any
+# SMT-enabled family — most of them — that under-reports by the threads-per-core
+# factor, typically 2x. Every EC2 export shipped to date carries the wrong value.
+# ---------------------------------------------------------------------------
+
+
+class TestVcpuSourcing:
+    @mock_aws
+    def test_vcpu_reports_threads_not_physical_cores(self):
+        """
+        m5.xlarge is 4 vCPU across 2 physical cores. Sourcing CoreCount would
+        report 2; the column must report 4.
+        """
+        ec2 = boto3.client("ec2", region_name=REGION)
+        ec2.run_instances(
+            ImageId=AMI_ID, MinCount=1, MaxCount=1, InstanceType="m5.xlarge"
+        )
+
+        rows = get_instance_data(REGION)
+
+        assert len(rows) == 1
+        assert rows[0]["vCPU"] == 4, "vCPU must be DefaultVCpus, not DefaultCores"
+        assert rows[0]["RAM (MiB)"] == 16 * 1024
+
+    @mock_aws
+    def test_reference_data_avoids_a_describe_instance_types_call(self, monkeypatch):
+        """
+        The static reference data covers ~1,200 types, so the common case must
+        not spend an API call. Proven by making the fallback fail loudly: if it
+        is reached, the export raises.
+        """
+        ec2 = boto3.client("ec2", region_name=REGION)
+        ec2.run_instances(
+            ImageId=AMI_ID, MinCount=1, MaxCount=1, InstanceType="m5.xlarge"
+        )
+
+        real_get_client = ec2_export.utils.get_boto3_client
+
+        class NoDescribeTypes:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __getattr__(self, name):
+                if name == "describe_instance_types":
+                    raise AssertionError(
+                        "describe_instance_types called for a type the "
+                        "reference data already covers"
+                    )
+                return getattr(self._wrapped, name)
+
+        monkeypatch.setattr(
+            ec2_export.utils,
+            "get_boto3_client",
+            lambda *a, **k: NoDescribeTypes(real_get_client(*a, **k)),
+        )
+
+        rows = get_instance_data(REGION)
+
+        assert rows[0]["vCPU"] == 4
+
+    @mock_aws
+    def test_type_absent_from_reference_data_falls_back_to_the_api(self, monkeypatch):
+        """A type the reference JSON does not carry still resolves."""
+        monkeypatch.setattr(ec2_export.utils, "load_instance_type_specs", dict)
+
+        ec2 = boto3.client("ec2", region_name=REGION)
+        ec2.run_instances(
+            ImageId=AMI_ID, MinCount=1, MaxCount=1, InstanceType="m5.xlarge"
+        )
+
+        rows = get_instance_data(REGION)
+
+        assert rows[0]["vCPU"] == 4, "fallback must also use DefaultVCpus"
+        assert rows[0]["RAM (MiB)"] == 16 * 1024
+
+    @mock_aws
+    def test_cores_and_threads_are_exported_alongside_vcpu(self, monkeypatch):
+        """
+        CoreCount and ThreadsPerCore are legitimate data in their own right —
+        they are just not vCPU. vCPU = cores x threads per core.
+        """
+        monkeypatch.setattr(ec2_export, "get_os_info_from_ssm", lambda *a, **k: "N/A")
+        monkeypatch.setattr(ec2_export, "get_os_info_from_ami", lambda *a, **k: "N/A")
+        ec2_client = boto3.client("ec2", region_name=REGION)
+
+        row = ec2_export._build_instance_row(
+            {
+                "InstanceId": "i-1234567890abcdef0",
+                "InstanceType": "m5.xlarge",
+                "State": {"Name": "running"},
+                "CpuOptions": {"CoreCount": 2, "ThreadsPerCore": 2},
+                "BlockDeviceMappings": [],
+            },
+            REGION,
+            ec2_client,
+            {},
+            {},
+            "test",
+            {"m5.xlarge": {"memory_mib": 16384, "vcpu": 4}},
+            {},
+        )
+
+        assert row["vCPU"] == 4
+        assert row["CPU Cores"] == 2
+        assert row["Threads per Core"] == 2
+
+    @mock_aws
+    def test_unresolvable_type_reports_na_not_a_wrong_number(self, monkeypatch):
+        monkeypatch.setattr(ec2_export, "get_os_info_from_ssm", lambda *a, **k: "N/A")
+        monkeypatch.setattr(ec2_export, "get_os_info_from_ami", lambda *a, **k: "N/A")
+        ec2_client = boto3.client("ec2", region_name=REGION)
+
+        row = ec2_export._build_instance_row(
+            {
+                "InstanceId": "i-1234567890abcdef0",
+                "InstanceType": "made.up",
+                "State": {"Name": "running"},
+                "BlockDeviceMappings": [],
+            },
+            REGION,
+            ec2_client,
+            {},
+            {},
+            "test",
+            {},
+            {},
+        )
+
+        assert row["vCPU"] == "N/A"
+        assert row["RAM (MiB)"] == "N/A"

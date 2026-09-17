@@ -288,30 +288,286 @@ def _write_markdown_report(
         return None
 
 
-def _zip_export_files(results: list, account_name: str) -> Optional[Path]:
+def _service_discovery_dir() -> Path:
     """
-    Zip all output files produced by the batch execution into a single archive.
+    Return (creating if needed) the directory that holds service-discovery archives.
+
+    Built from ``utils.get_output_dir()`` rather than a filename containing a
+    separator: ``get_output_filepath()`` rejects separators by design
+    (containment), so the subdirectory has to be composed from the output root.
+    Deriving it this way also means ``--output-dir`` is honored for free.
+    """
+    target = utils.get_output_dir() / "service-discovery"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+# Exporters that decline to run — no permission, service absent from the
+# partition — still exit 0 and drop a marker workbook whose name carries this
+# token. Deliberately distinct from the real-export filename patterns so a
+# marker never satisfies an export glob.
+_SKIP_MARKER_TOKEN = '-skipped-'
+
+
+def _is_skip_marker(name: str) -> bool:
+    """True when a produced filename is a deliberate-skip marker workbook."""
+    return _SKIP_MARKER_TOKEN in name
+
+
+def _skip_reason_from_filename(name: str) -> str:
+    """
+    Derive a human-readable skip reason from a marker workbook filename.
+
+    Marker names look like ``ACCT-billing-skipped-no-permission-export-DATE.xlsx``;
+    the text between the skip token and the trailing ``-export-`` is the reason.
+    """
+    try:
+        tail = name.split(_SKIP_MARKER_TOKEN, 1)[1]
+        reason = tail.split('-export-', 1)[0]
+    except IndexError:
+        return 'skipped'
+    reason = reason.replace('-', ' ').strip()
+    if not reason:
+        return 'skipped'
+    if reason == 'no permission':
+        return 'missing permission'
+    if reason == 'govcloud':
+        return 'not available in this partition (GovCloud)'
+    return reason
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a wall-clock duration the same way ExecutionResult does."""
+    secs = int(seconds or 0)
+    hours, minutes, rem = secs // 3600, (secs % 3600) // 60, secs % 60
+    if hours:
+        return f"{hours}h {minutes}m {rem}s"
+    if minutes:
+        return f"{minutes}m {rem}s"
+    return f"{rem}s"
+
+
+def _session_output_records(session: Optional[dict], results: list) -> list[dict]:
+    """
+    Flatten every run of a session into one ordered list of result records.
+
+    The session file is the union view: it accumulates records across the
+    interrupted run and every resume, so archiving from it fixes the
+    resumed-zip-omits-the-first-run defect (#291). Current-run
+    ExecutionResult objects are folded in as a fallback for callers with no
+    session, and to cover a record the session failed to persist.
+    """
+    records: list[dict] = []
+    seen_keys: set[str] = set()
+
+    for r in (session or {}).get('results', []):
+        key = str(r.get('key') or r.get('script') or '')
+        records.append({
+            'script': r.get('script') or key,
+            'status': r.get('status', 'unknown'),
+            'duration_s': r.get('duration_s', 0.0),
+            'output_file': r.get('output_file'),
+        })
+        seen_keys.add(key)
+
+    for r in results:
+        if r.script in seen_keys:
+            continue
+        records.append({
+            'script': r.script,
+            'status': 'success' if r.success else 'failed',
+            'duration_s': r.duration_seconds,
+            'output_file': r.output_file,
+        })
+        seen_keys.add(r.script)
+
+    return records
+
+
+def _partition_records(records: list[dict]) -> tuple[list[dict], list[dict], list[dict], list[Path]]:
+    """
+    Split result records into (ran, skipped, missing, files-to-archive).
+
+    - ran:     produced a real export workbook that is still on disk
+    - skipped: exited 0 but declined to collect (marker workbook), or produced
+               no output at all
+    - missing: recorded an output file that is no longer on disk — reported,
+               never silently dropped
+    """
+    ran: list[dict] = []
+    skipped: list[dict] = []
+    missing: list[dict] = []
+    files: list[Path] = []
+    seen_files: set[str] = set()
+
+    for rec in records:
+        out = rec.get('output_file')
+        if not out:
+            if rec.get('status') == 'success':
+                rec = {**rec, 'reason': 'completed without producing an output file'}
+                skipped.append(rec)
+            else:
+                ran.append(rec)
+            continue
+
+        path = Path(out)
+        name = path.name
+        if path.exists():
+            if str(path) not in seen_files:
+                files.append(path)
+                seen_files.add(str(path))
+        else:
+            missing.append({**rec, 'reason': 'output file no longer present on disk'})
+            continue
+
+        if _is_skip_marker(name):
+            skipped.append({**rec, 'reason': _skip_reason_from_filename(name)})
+        else:
+            ran.append(rec)
+
+    return ran, skipped, missing, files
+
+
+def _scan_report_markdown(
+    account_name: str,
+    account_id: str,
+    regions: list[str],
+    services: Optional[list[str]],
+    ran: list[dict],
+    skipped: list[dict],
+    missing: list[dict],
+    crosscheck: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Build the scan report that travels inside the archive.
+
+    Deliberately count-free in the Services In Use section: a number beside a
+    service name reads as an asset inventory, and several exporters emit
+    summaries rather than inventories, which would make that number wrong.
+    """
+    now = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
+    lines = [
+        "# AWS Service Discovery Scan Report",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Account | {account_name} ({utils.mask_account_id(account_id)}) |",
+        f"| Regions Scanned | {', '.join(regions) if regions else 'unknown'} |",
+        f"| Tool Version | {utils.get_version()} |",
+        f"| Report Generated | {now} |",
+        "",
+        "---",
+        "",
+        "## Services In Use",
+        "",
+    ]
+
+    if services:
+        for name in sorted(services):
+            lines.append(f"- {name}")
+    else:
+        lines.append("_Service discovery results were not recorded for this session._")
+    lines += ["", "---", "", "## What Ran", ""]
+
+    if ran:
+        lines += [
+            "| Script | Result | Duration | Output File |",
+            "|---|---|---|---|",
+        ]
+        for rec in sorted(ran, key=lambda r: r['script']):
+            status = 'success' if rec.get('status') == 'success' else 'FAILED'
+            out = Path(rec['output_file']).name if rec.get('output_file') else '—'
+            lines.append(
+                f"| `{rec['script']}` | {status} | "
+                f"{_format_duration(rec.get('duration_s', 0.0))} | {out} |"
+            )
+    else:
+        lines.append("_No export scripts produced data in this session._")
+    lines += ["", "---", "", "## What Was Skipped And Why", ""]
+
+    if skipped:
+        lines += [
+            "These exporters exited cleanly without collecting data. A skip is not a "
+            "clean result — treat each row as a coverage gap.",
+            "",
+            "| Script | Reason | Marker File |",
+            "|---|---|---|",
+        ]
+        for rec in sorted(skipped, key=lambda r: r['script']):
+            marker = Path(rec['output_file']).name if rec.get('output_file') else '—'
+            lines.append(f"| `{rec['script']}` | {rec.get('reason', 'skipped')} | {marker} |")
+    else:
+        lines.append("No exporters were skipped.")
+    lines.append("")
+
+    if missing:
+        lines += [
+            "---",
+            "",
+            "## Missing Prior Outputs",
+            "",
+            "These scripts recorded an output file in an earlier run of this session, "
+            "but the file is no longer on disk and is therefore **not** in this archive.",
+            "",
+            "| Script | Missing File |",
+            "|---|---|",
+        ]
+        for rec in sorted(missing, key=lambda r: r['script']):
+            lines.append(f"| `{rec['script']}` | {Path(rec['output_file']).name} |")
+        lines.append("")
+
+    lines += _crosscheck_markdown_lines(crosscheck)
+    return '\n'.join(lines)
+
+
+def _zip_export_files(
+    results: list,
+    account_name: str,
+    report_text: Optional[str] = None,
+    extra_files: Optional[list] = None,
+) -> Optional[Path]:
+    """
+    Zip output files produced by the batch execution into a single archive.
+
+    The archive lands in ``output/service-discovery/``; one-off exports still
+    write to the output root.
 
     Args:
         results: List of ExecutionResult objects from execute_all()
-        account_name: AWS account name (used in the zip filename)
+        account_name: AWS account name (used in the zip and report filenames)
+        report_text: Optional Markdown scan report written into the archive.
+        extra_files: Additional output paths to include — used to fold in
+                     outputs from earlier runs of a resumed session.
 
     Returns:
-        Path to the zip file, or None if no files to zip or on failure.
+        Path to the zip file, or None if there is nothing to zip or on failure.
     """
-    output_files = [Path(r.output_file) for r in results if r.output_file]
-    if not output_files:
+    output_files: list[Path] = []
+    seen: set[str] = set()
+    for candidate in [Path(r.output_file) for r in results if r.output_file] + [
+        Path(p) for p in (extra_files or [])
+    ]:
+        if str(candidate) not in seen:
+            output_files.append(candidate)
+            seen.add(str(candidate))
+
+    if not output_files and not report_text:
         return None
 
     timestamp = utils.get_export_date()
     zip_name = f"{account_name}-service-discovery-export-{timestamp}.zip"
-    zip_path = utils.get_output_dir() / zip_name
+    zip_path = _service_discovery_dir() / zip_name
 
     try:
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for file_path in output_files:
                 if file_path.exists():
                     zf.write(file_path, file_path.name)
+            if report_text:
+                report_name = (
+                    f"{account_name}-service-discovery-report-{timestamp}.md"
+                )
+                zf.writestr(report_name, report_text)
 
         # Remove individual files now that they are safely inside the zip
         for file_path in output_files:
@@ -324,6 +580,31 @@ def _zip_export_files(results: list, account_name: str) -> Optional[Path]:
     except Exception as e:
         utils.log_warning(f"Failed to create zip archive: {e}")
         return None
+
+
+def _archive_session(
+    session: Optional[dict],
+    results: list,
+    account_name: str,
+    account_id: str,
+    regions: list[str],
+    services: Optional[list[str]] = None,
+    crosscheck: Optional[dict[str, Any]] = None,
+) -> Optional[Path]:
+    """
+    Build the scan report and zip every output of the session into one archive.
+
+    Shared by the fresh-run and resume paths so both entry points deliver the
+    same archive: the union of all runs of the session, plus the report.
+    """
+    records = _session_output_records(session, results)
+    ran, skipped, missing, files = _partition_records(records)
+
+    report_text = _scan_report_markdown(
+        account_name, account_id, regions, services, ran, skipped, missing,
+        crosscheck=crosscheck,
+    )
+    return _zip_export_files([], account_name, report_text=report_text, extra_files=files)
 
 
 def _resume_from_session(session_path: str) -> None:
@@ -339,6 +620,11 @@ def _resume_from_session(session_path: str) -> None:
         print(f"\n  ❌ Could not load session: {exc}")
         return
 
+    account_id = session.get("account_id") or ""
+    account_name = session.get("account_name") or ""
+    if not account_name:
+        account_id, account_name = utils.get_account_info()
+
     done_keys = {r["key"] for r in session.get("results", []) if r.get("status") == "success"}
     all_planned = {p["key"] for p in session.get("planned", [])}
     remaining = all_planned - done_keys
@@ -349,24 +635,41 @@ def _resume_from_session(session_path: str) -> None:
     print(f"\n  Resuming Smart Scan: {n_done}/{n_total} scripts already complete")
     print(f"  {len(remaining)} script(s) remaining\n")
 
-    if not remaining:
+    services = session.get("services")
+    summary: dict[str, Any] = {}
+
+    if remaining:
+        regions = session.get("regions") or utils.prompt_region_selection()
+        utils.resume_scan_session(session)
+
+        print(f"\n  Executing {len(remaining)} scripts...\n")
+        summary = execute_scripts(
+            remaining,
+            show_progress=True,
+            save_log=False,
+            regions=regions,
+            show_output=False,
+            session=session,
+            skip_scripts=None,
+        )
+    else:
         print("  ✅ All scripts already completed.")
+        regions = session.get("regions") or []
         utils.complete_scan_session(session)
-        return
 
-    regions = utils.prompt_region_selection()
-    utils.resume_scan_session(session)
-
-    print(f"\n  Executing {len(remaining)} scripts...\n")
-    execute_scripts(
-        remaining,
-        show_progress=True,
-        save_log=False,
-        regions=regions,
-        show_output=False,
-        session=session,
-        skip_scripts=None,
+    # Archive regardless of whether anything remained to run: the earlier
+    # interrupted run never reached its zip step, so its outputs are still loose.
+    zip_path = _archive_session(
+        session,
+        summary.get("results", []),
+        account_name,
+        account_id,
+        regions,
+        services=services,
+        crosscheck=session.get("crosscheck"),
     )
+    if zip_path:
+        utils.log_success(f"  Exports zipped: {zip_path}")
 
 
 def _run_bill_crosscheck(
@@ -684,6 +987,17 @@ def main() -> None:
             planned,
         )
 
+    # Persist the run context so an interruption does not cost the report its
+    # header, region list or discovered-service list on resume.
+    utils.update_scan_session(
+        session,
+        account_id=account_id,
+        account_name=account_name,
+        regions=regions,
+        services=sorted(services.keys()),
+        crosscheck=crosscheck,
+    )
+
     print(f"\n  Executing {len(selected_scripts)} scripts...\n")
     summary = execute_scripts(
         selected_scripts,
@@ -695,8 +1009,16 @@ def main() -> None:
         skip_scripts=skip_scripts,
     )
 
-    # Zip all output files produced by this run
-    zip_path = _zip_export_files(summary.get('results', []), account_name)
+    # Archive every output of this session (all runs) plus the scan report
+    zip_path = _archive_session(
+        session,
+        summary.get('results', []),
+        account_name,
+        account_id,
+        regions,
+        services=sorted(services.keys()),
+        crosscheck=crosscheck,
+    )
     if zip_path:
         utils.log_success(f"  Exports zipped: {zip_path}")
 

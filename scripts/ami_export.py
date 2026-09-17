@@ -18,6 +18,8 @@ Features:
 - Creation date and architecture (x86_64, arm64)
 - Virtualization type and root device type
 - EBS snapshot IDs for backup tracking
+- Ancestry: source instance and parent AMI, from contractual DescribeImages
+  fields (one hop — join the sheet to itself to walk lineage)
 - Public/Private status
 - Platform details (Linux, Windows)
 - Block device mappings
@@ -50,6 +52,81 @@ except ImportError:
         print("ERROR: Could not import the utils module. Make sure utils.py is in the StratusScan directory.")
         sys.exit(1)
 args = utils.parse_script_args("Export Amazon Machine Images (AMIs) to Excel")
+
+
+# ---------------------------------------------------------------------------
+# AMI ancestry (Issue #270)
+#
+# The export described what an AMI *is* and nothing about where it came from.
+# Ancestry now comes only from contractual DescribeImages fields.
+#
+# A snapshot-description parse was tried first and removed in Issue #272: AWS
+# writes "Created by CreateImage(i-xxx) for ami-yyy", where ami-yyy is the AMI
+# *being created*, not its parent. Across five live accounts the parsed value
+# equalled the row's own AMI ID in 2,320 of 2,322 cases — a tautology, not
+# lineage. SourceImageId already carries the real parent, for CreateImage-
+# derived images as well as copies.
+#
+# One hop, not a chain. Each row names its immediate ancestor; a consumer
+# self-joins the sheet to walk lineage. Recursive resolution would mean
+# describing images owned by other accounts, unbounded depth, and dead ends
+# wherever an ancestor was deregistered.
+# ---------------------------------------------------------------------------
+
+# Distinct from 'N/A': the field is absent from this botocore's model, so AWS
+# was never asked. Collapsing the two would repeat the mistake that made the
+# scaling-policy alarm gap invisible (Issue #268).
+#
+# This state matters more since Issue #272 removed the snapshot-description
+# fallback: SourceImageId is now the ONLY ancestry source, so an old botocore
+# means no parent can be reported at all, not merely a less precise one.
+_COPY_SOURCE_UNSUPPORTED = 'Unavailable (boto3 too old)'
+
+
+def _copy_source_supported(ec2_client) -> bool:
+    """
+    Whether this botocore models ``SourceImageId`` on DescribeImages.
+
+    The source-image fields postdate the project's pinned boto3 floor (absent
+    in 1.34.46, present in 1.43.83), so the column has to distinguish "AWS
+    reported no source" from "this client cannot report a source at all" — see
+    Issue #213 for the wider version-floor problem.
+    """
+    try:
+        image_shape = (
+            ec2_client.meta.service_model
+            .operation_model('DescribeImages')
+            .output_shape.members['Images'].member
+        )
+        return 'SourceImageId' in image_shape.members
+    except Exception:  # noqa: BLE001 - unknown model shape; assume unsupported
+        return False
+
+
+def _ancestry_columns(ami: dict, copy_source_supported: bool) -> dict[str, Any]:
+    """
+    Build the ancestry columns for one AMI, from contractual fields only.
+
+    ``SourceImageId`` is the **parent AMI** — the image this one was derived
+    from. It is populated for ``CreateImage``-derived AMIs as well as copies,
+    which is the common case; #270 wrongly described it as copy-only.
+
+    Ancestry is partial by nature: an AMI imported via VM Import, built by a
+    third party, or whose parent was deregistered has no resolvable ancestor.
+    That is a correct result, not a collection failure.
+    """
+    if copy_source_supported:
+        source_image_id = ami.get('SourceImageId') or 'N/A'
+        source_image_region = ami.get('SourceImageRegion') or 'N/A'
+    else:
+        source_image_id = _COPY_SOURCE_UNSUPPORTED
+        source_image_region = _COPY_SOURCE_UNSUPPORTED
+
+    return {
+        'Source Instance ID': ami.get('SourceInstanceId') or 'N/A',
+        'Source Image ID': source_image_id,
+        'Source Image Region': source_image_region,
+    }
 
 
 def _build_ami_row(ami: dict, region: str) -> dict[str, Any]:
@@ -178,10 +255,17 @@ def collect_amis_in_region(region: str, account_id: str) -> list[dict[str, Any]]
 
     print(f"  Found {len(amis)} account-owned AMIs")
 
+    # Ancestry comes from fields already present in the describe_images
+    # response above — no additional API calls (Issue #272 removed the
+    # describe_snapshots round trip along with the parse it fed).
+    copy_source_supported = _copy_source_supported(ec2_client)
+
     region_amis = []
     for ami in amis:
         try:
-            region_amis.append(_build_ami_row(ami, region))
+            row = _build_ami_row(ami, region)
+            row.update(_ancestry_columns(ami, copy_source_supported))
+            region_amis.append(row)
         except Exception as e:
             # One malformed AMI is skipped, not fatal to the region.
             utils.log_error(

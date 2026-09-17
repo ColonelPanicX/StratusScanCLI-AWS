@@ -203,8 +203,16 @@ def format_tags(tags):
 
 def load_pricing_data(region='us-east-1'):
     """
-    Load EC2 pricing data from the reference JSON file.
-    Selects the correct pricing block based on the region's partition.
+    Load EC2 pricing rates and their provenance.
+
+    Rates come from AWS's published Price List Bulk feed via
+    ``utils.get_pricing_data`` -- fetched live when the feed is reachable,
+    replayed from a version-keyed cache when it is fresh, and read from the
+    bundled reference/ snapshot otherwise. One code path, so the fallback
+    cannot drift from the live data (Issue #297).
+
+    The pricing block is selected by partition, never computed from the other:
+    GovCloud rates are pulled from the GovCloud feed.
 
     Args:
         region (str): AWS region being scanned, used to detect partition and
@@ -212,25 +220,26 @@ def load_pricing_data(region='us-east-1'):
                       commercial, us-gov-west-1 for GovCloud).
 
     Returns:
-        dict: {instance_type: {'linux': float|None, 'windows': float|None,
-                                'memory_gib': float|None}}
+        tuple: ``(pricing_data, provenance)`` where pricing_data is
+        ``{instance_type: {'linux': float|None, 'windows': float|None,
+        'memory_gib': float|None}}``.
     """
     pricing_data = {}
+    records, provenance = utils.get_pricing_data('AmazonEC2')
+
+    if not records:
+        utils.log_warning(
+            "No EC2 pricing records available "
+            f"({provenance.get('fallback_reason', 'unknown reason')}) - "
+            "cost columns will read N/A"
+        )
+        return pricing_data, provenance
+
     try:
-        script_dir = Path(__file__).parent.absolute()
-        pricing_file = script_dir.parent / 'reference' / 'ec2-pricing.json'
-
-        if not pricing_file.exists():
-            utils.log_warning(f"Pricing file not found at {pricing_file}")
-            return pricing_data
-
-        with open(pricing_file, encoding='utf-8') as f:
-            json_data = json.load(f)
-
         partition = utils.detect_partition(region)
         pricing_region = 'us-gov-west-1' if partition == 'aws-us-gov' else 'us-east-1'
 
-        for instance_type, data in json_data.get('records', {}).items():
+        for instance_type, data in records.items():
             regional = (
                 data.get('pricing', {}).get(pricing_region)
                 or data.get('pricing', {}).get('us-east-1', {})
@@ -243,13 +252,13 @@ def load_pricing_data(region='us-east-1'):
 
         utils.log_info(
             f"Loaded pricing data for {len(pricing_data)} instance types "
-            f"({pricing_region} pricing)"
+            f"({pricing_region} pricing; {utils.pricing_provenance_note(provenance)})"
         )
-        return pricing_data
+        return pricing_data, provenance
 
     except Exception as e:
         utils.log_warning(f"Error loading pricing data: {e}")
-        return pricing_data
+        return pricing_data, provenance
 
 def load_storage_pricing_data():
     """
@@ -441,7 +450,8 @@ def _build_instance_row(instance, region, ec2_client, pricing_data, storage_pric
         pricing_data (dict): EC2 instance pricing data.
         storage_pricing (dict): EBS/storage pricing data.
         cost_note (str): Partition-aware cost estimate note.
-        instance_types_map (dict): Prefetched {instance_type: memory_mib}.
+        instance_types_map (dict): Prefetched
+            {instance_type: {'memory_mib': int, 'vcpu': int}}.
         volumes_map (dict): Prefetched {volume_id: volume_dict}.
 
     Returns:
@@ -462,9 +472,15 @@ def _build_instance_row(instance, region, ec2_client, pricing_data, storage_pric
         instance.get('Platform', '')
     )
 
-    # Get RAM info from the prefetched instance types map
+    # Get vCPU and RAM from the prefetched instance types map
     instance_type = instance.get('InstanceType', 'N/A')
-    ram_mib = instance_types_map.get(instance_type, 'N/A')
+    type_spec = instance_types_map.get(instance_type) or {}
+    ram_mib = type_spec.get('memory_mib', 'N/A')
+    vcpu = type_spec.get('vcpu', 'N/A')
+
+    # CoreCount and ThreadsPerCore are legitimate data in their own right —
+    # they are just not vCPU. vCPU = cores x threads per core.
+    cpu_options = instance.get('CpuOptions', {}) or {}
 
     # For root device size and type, we need to ensure we're fetching it correctly
     root_device_size = 'N/A'
@@ -556,7 +572,9 @@ def _build_instance_row(instance, region, ec2_client, pricing_data, storage_pric
         'Key Pair': instance.get('KeyName', 'N/A'),
         'Region': region,
         'Owner ID': utils.get_account_name_formatted(instance.get('OwnerId', 'N/A')),
-        'vCPU': instance.get('CpuOptions', {}).get('CoreCount', 'N/A'),
+        'vCPU': vcpu,
+        'CPU Cores': cpu_options.get('CoreCount', 'N/A'),
+        'Threads per Core': cpu_options.get('ThreadsPerCore', 'N/A'),
         'RAM (MiB)': ram_mib,
         'Root Device Volume ID': root_volume_id,
         'Root Device Size (GiB)': root_device_size,
@@ -597,7 +615,7 @@ def get_instance_data(region, instance_filter=None):
     instances = []
 
     # Load pricing data
-    pricing_data = load_pricing_data(region)
+    pricing_data, pricing_provenance = load_pricing_data(region)
     storage_pricing = load_storage_pricing_data()
 
     # Prepare filters if needed
@@ -644,8 +662,12 @@ def get_instance_data(region, instance_filter=None):
             except Exception as e:
                 utils.log_warning(f"Error prefetching volumes in {region}: {e}")
 
-    # Build RAM map from pricing JSON (memory_gib -> MiB); fall back to
-    # describe_instance_types for any types absent from the JSON.
+    # Build the per-type spec map (vCPU + RAM) from the static reference data,
+    # falling back to describe_instance_types for any type absent from it.
+    #
+    # vCPU must come from here, not from the instance's CpuOptions.CoreCount:
+    # CoreCount is *physical cores* and under-reports by the threads-per-core
+    # factor — 2x on most families (Issue #259).
     instance_types_map = {}
     if total_instances > 0:
         unique_types = list({
@@ -654,11 +676,17 @@ def get_instance_data(region, instance_filter=None):
             for inst in reservation.get('Instances', [])
             if inst.get('InstanceType')
         })
+        reference_specs = utils.load_instance_type_specs()
         unknown_types = []
         for it in unique_types:
-            memory_gib = pricing_data.get(it, {}).get('memory_gib')
-            if memory_gib is not None:
-                instance_types_map[it] = int(memory_gib * 1024)
+            record = reference_specs.get(it) or {}
+            memory_gib = record.get('memory_gib')
+            vcpu = record.get('vcpu')
+            if memory_gib is not None and vcpu is not None:
+                instance_types_map[it] = {
+                    'memory_mib': int(memory_gib * 1024),
+                    'vcpu': vcpu,
+                }
             else:
                 unknown_types.append(it)
         for i in range(0, len(unknown_types), 100):
@@ -666,15 +694,21 @@ def get_instance_data(region, instance_filter=None):
             try:
                 resp = ec2.describe_instance_types(InstanceTypes=chunk)
                 for it in resp.get('InstanceTypes', []):
-                    instance_types_map[it['InstanceType']] = it.get('MemoryInfo', {}).get('SizeInMiB', 'N/A')
+                    instance_types_map[it['InstanceType']] = {
+                        'memory_mib': it.get('MemoryInfo', {}).get('SizeInMiB', 'N/A'),
+                        'vcpu': it.get('VCpuInfo', {}).get('DefaultVCpus', 'N/A'),
+                    }
             except Exception as e:
                 utils.log_warning(f"Error fetching instance types in {region}: {e}")
 
+    # The pricing source belongs in the workbook, not only in a docstring.
+    # Issue #296 sat undetected for seven months because a Cost Note said
+    # "Estimate (us-east-1 pricing)" whether the rate was retrieved or invented.
     _partition = utils.detect_partition(region)
+    _pricing_region = 'us-gov-west-1' if _partition == 'aws-us-gov' else 'us-east-1'
     cost_note = (
-        "Estimate (us-gov-west-1 pricing)"
-        if _partition == 'aws-us-gov'
-        else "Estimate (us-east-1 pricing)"
+        f"Estimate ({_pricing_region} pricing; "
+        f"{utils.pricing_provenance_note(pricing_provenance)})"
     )
 
     # Process each instance. One malformed instance must not sink the region,

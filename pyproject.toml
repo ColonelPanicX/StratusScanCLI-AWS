@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stratusscancli-aws"
-version = "0.7.0-beta"
+version = "0.8.0-beta"
 description = "AWS defensive security scanning and auditing tool for resource exports"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -190,7 +190,10 @@ python_functions = ["test_*"]
 addopts = [
     "-v",                           # Verbose output
     "--strict-markers",             # Error on unknown markers
-    "-m", "not aws",                # Skip live-AWS tests by default (use -m aws to run them)
+    # Skip live-AWS tests (use -m aws) and network-bound feed-agreement tests
+    # (use -m integration) by default. The default suite stays offline so it is
+    # safe in CI and in a fresh CloudShell.
+    "-m", "not aws and not integration",
     "--cov=.",                      # Coverage for all code
     "--cov-report=html",            # HTML coverage report
     "--cov-report=term-missing",    # Terminal report with missing lines

@@ -48,10 +48,36 @@ def get_default_settings():
             'enabled': True,
             'expire_after_minutes': 0,  # 0 = no expiration (session-only)
         },
+        # Pricing rates come from AWS's public Price List Bulk feed, which
+        # needs no credentials and no IAM grant. Any failure here falls back to
+        # the bundled reference/ snapshot -- an export is never blocked on it.
+        'pricing': {
+            # Attempt the feed at all. Turn this off for an air-gapped or
+            # egress-restricted environment to skip the network entirely
+            # rather than waiting for it to time out.
+            'live_feed_enabled': True,
+            # How long a cached artifact for a still-current feed version is
+            # reused. The cache is keyed by feed version, so a newly published
+            # feed is never served from a stale entry regardless of this value.
+            'cache_ttl_hours': 168,
+            # The feed host serves no compression, so this is literal wire
+            # bytes, and it is checked against the sum across Regions. 640 MiB
+            # clears AmazonEC2's 508,593,885-byte total (302,856,576 us-east-1
+            # plus 205,737,309 us-gov-west-1).
+            'max_feed_bytes': 671088640,
+            'timeout_seconds': 30,
+            # Hard wall-clock budget. Past this the fetch is abandoned and the
+            # bundled snapshot is used.
+            'max_seconds': 180,
+        },
         'performance': {
             'batch_dataframe_size': 1000,
             'api_retry_attempts': 3,
             'api_retry_delay_seconds': 2,
+            # Auto Scaling activity history is unbounded; cap what we pull per
+            # group so a busy account cannot turn one export into thousands of
+            # API calls (Issue #261).
+            'scaling_activity_limit': 100,
         }
     }
 
@@ -299,10 +325,33 @@ def configure_performance():
         except ValueError:
             print("   ERROR: Please enter a valid number.")
 
+    # Scaling activity history limit
+    print("\n4. Scaling Activity History Limit")
+    print("   Maximum scaling activities to export per Auto Scaling Group.")
+    print("   AWS returns activity history newest-first and unbounded; this caps it.")
+    print("   Higher values = deeper history but more API calls on busy groups")
+
+    while True:
+        activity_input = input(
+            f"   Activities per group (10-1000) "
+            f"[Current: {current['scaling_activity_limit']}]: "
+        ).strip()
+        if not activity_input:
+            activity_limit = current['scaling_activity_limit']
+            break
+        try:
+            activity_limit = int(activity_input)
+            if 10 <= activity_limit <= 1000:
+                break
+            print("   ERROR: Please enter a number between 10 and 1000.")
+        except ValueError:
+            print("   ERROR: Please enter a valid number.")
+
     return {
         'batch_dataframe_size': batch_size,
         'api_retry_attempts': retry_attempts,
         'api_retry_delay_seconds': retry_delay,
+        'scaling_activity_limit': activity_limit,
     }
 
 
@@ -345,10 +394,20 @@ def display_current_settings():
     expire = settings['caching']['expire_after_minutes']
     print(f"  Expiration: {'Session-only' if expire == 0 else f'{expire} minutes'}")
 
+    pricing = settings['pricing']
+    print("\nPricing Feed:")
+    print(f"  Live Feed Enabled: {pricing['live_feed_enabled']}")
+    ttl = pricing['cache_ttl_hours']
+    print(f"  Cache TTL: {'No expiry' if ttl == 0 else f'{ttl} hours'}")
+    print(f"  Max Feed Size: {pricing['max_feed_bytes']:,} bytes")
+    print(f"  Timeout: {pricing['timeout_seconds']}s per socket, "
+          f"{pricing['max_seconds']}s total")
+
     print("\nPerformance:")
     print(f"  Batch DataFrame Size: {settings['performance']['batch_dataframe_size']}")
     print(f"  API Retry Attempts: {settings['performance']['api_retry_attempts']}")
     print(f"  API Retry Delay: {settings['performance']['api_retry_delay_seconds']}s")
+    print(f"  Scaling Activity Limit: {settings['performance']['scaling_activity_limit']} per group")
 
     print("="*70)
 

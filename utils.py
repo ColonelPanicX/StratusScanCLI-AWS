@@ -4559,6 +4559,174 @@ def _load_pricing_json(filename: str, default: dict[str, float]) -> dict[str, fl
     return default
 
 
+# =============================================================================
+# PRICING FEED ACCESS (Issue #297)
+# =============================================================================
+
+
+def _pricing_settings() -> dict[str, Any]:
+    """
+    Read the ``pricing`` block of advanced settings, with defaults for gaps.
+
+    Defaults live in ``pricing_feed`` so the module is usable without a
+    config.json at all -- a fresh CloudShell session has none until the wizard
+    runs.
+    """
+    import pricing_feed
+
+    defaults = {
+        "live_feed_enabled": pricing_feed.DEFAULT_LIVE_FEED_ENABLED,
+        "cache_ttl_hours": pricing_feed.DEFAULT_CACHE_TTL_HOURS,
+        "max_feed_bytes": pricing_feed.DEFAULT_MAX_FEED_BYTES,
+        "timeout_seconds": pricing_feed.DEFAULT_TIMEOUT_SECONDS,
+        "max_seconds": pricing_feed.DEFAULT_MAX_SECONDS,
+    }
+    try:
+        configured = config_value("pricing", {}, section="advanced_settings") or {}
+        if isinstance(configured, dict):
+            defaults.update({k: v for k, v in configured.items() if k in defaults})
+    except Exception as exc:  # noqa: BLE001 - settings must never block an export
+        logging.getLogger(__name__).warning(
+            "Could not read pricing advanced settings (%s) - using defaults", exc
+        )
+
+    # Environment override, for air-gapped runs, CI, and any context where
+    # reaching a public endpoint is not acceptable and editing config.json is
+    # not convenient. The env var wins over config.json deliberately: it is the
+    # lever an operator reaches for when a network call must not happen.
+    override = os.environ.get("STRATUSSCAN_PRICING_LIVE_FEED")
+    if override is not None:
+        defaults["live_feed_enabled"] = override.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+            "",
+        )
+    return defaults
+
+
+def get_pricing_data(offer_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Return ``(records, provenance)`` for one AWS offer code.
+
+    The one pricing entry point for exporters. Serves the live AWS Price List
+    Bulk feed when it is reachable, a version-keyed local cache when it is
+    fresh, and the bundled ``reference/`` snapshot otherwise -- all through a
+    single code path, so the three differ only in what ``provenance`` reports.
+
+    No value returned here is derived. Every rate came from a feed row, in the
+    live case and the bundled case alike, because both are produced by the same
+    extractor (see ``pricing_feed.extract_ec2_records`` and
+    ``tools/refresh_pricing.py``).
+
+    A fetch failure of any kind -- no egress, blocked DNS, proxy denial,
+    timeout, oversized feed -- is not an error. It falls back, records the
+    reason in provenance, and the export proceeds.
+
+    Args:
+        offer_code: AWS offer code, e.g. ``"AmazonEC2"``.
+
+    Returns:
+        ``(records, provenance)``. ``records`` is empty only when the bundled
+        snapshot is also unreadable; provenance then reports
+        ``source='unavailable'``. Callers must not read an empty map as
+        "nothing costs anything".
+    """
+    import pricing_feed
+
+    settings = _pricing_settings()
+    try:
+        return pricing_feed.get_pricing(
+            offer_code,
+            live_feed_enabled=bool(settings["live_feed_enabled"]),
+            cache_ttl_hours=float(settings["cache_ttl_hours"]),
+            max_feed_bytes=int(settings["max_feed_bytes"]),
+            timeout_seconds=float(settings["timeout_seconds"]),
+            max_seconds=float(settings["max_seconds"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - pricing must never sink an export
+        logging.getLogger(__name__).warning(
+            "Pricing lookup for %s failed entirely: %s", offer_code, exc
+        )
+        return {}, {
+            "source": pricing_feed.SOURCE_UNAVAILABLE,
+            "fallback_reason": "pricing lookup raised",
+        }
+
+
+def pricing_provenance_note(provenance: dict[str, Any]) -> str:
+    """
+    Render a provenance block as one phrase for a workbook's ``Cost Note``.
+
+    Exporters append this to their existing cost note so a reader can tell, per
+    row, whether a figure came from a live feed version or a bundled snapshot.
+    Issue #296 went unnoticed for seven months because no export said.
+    """
+    import pricing_feed
+
+    return pricing_feed.provenance_note(provenance or {})
+
+
+_INSTANCE_SPECS_LOCK = threading.Lock()
+_INSTANCE_SPECS_CACHE: Optional[dict[str, dict[str, Any]]] = None
+
+
+def load_instance_type_specs() -> dict[str, dict[str, Any]]:
+    """
+    Load static per-instance-type hardware specs from reference/ec2-pricing.json.
+
+    Returns a ``{instance_type: {'vcpu': int|None, 'memory_gib': float|None,
+    'architecture': str|None}}`` map. These values are partition-independent —
+    an ``m5.xlarge`` has the same vCPU and memory count in GovCloud as in
+    commercial — so unlike the pricing blocks this map needs no region argument.
+
+    ``vcpu`` here is the true vCPU count (threads), not physical cores. Callers
+    must prefer this over ``CpuOptions.CoreCount`` from a describe-instances
+    response, which reports physical cores and under-reports by the SMT factor
+    on most instance families (see Issue #259).
+
+    The result is cached; the reference file does not change at runtime. Any
+    I/O or parse error yields an empty map, leaving callers to fall back to
+    ``ec2:DescribeInstanceTypes``.
+
+    Returns:
+        Dict mapping instance type → spec dict. Empty on error.
+    """
+    global _INSTANCE_SPECS_CACHE
+
+    with _INSTANCE_SPECS_LOCK:
+        if _INSTANCE_SPECS_CACHE is not None:
+            return _INSTANCE_SPECS_CACHE
+
+        specs: dict[str, dict[str, Any]] = {}
+        json_path = _REFERENCE_DIR / "ec2-pricing.json"
+        try:
+            with json_path.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+            for instance_type, record in data.get("records", {}).items():
+                specs[instance_type] = {
+                    "vcpu": record.get("vcpu"),
+                    "memory_gib": record.get("memory_gib"),
+                    "architecture": record.get("architecture"),
+                }
+        except FileNotFoundError:
+            logging.getLogger(__name__).warning(
+                "Instance spec reference not found: %s — falling back to describe_instance_types",
+                json_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Error reading instance spec reference %s: %s — falling back to "
+                "describe_instance_types",
+                json_path,
+                exc,
+            )
+
+        _INSTANCE_SPECS_CACHE = specs
+        return specs
+
+
 def _load_rds_instance_pricing() -> dict[str, float]:
     """
     Build an ``{instance_class: hourly_rate_usd}`` map from rds-pricing.json.
@@ -5080,4 +5248,21 @@ def resume_scan_session(session: dict) -> None:
     """Mark an interrupted session as running again (for resume flows)."""
     session["status"] = "running"
     session["completed_at"] = None
+    _write_scan_session(session)
+
+
+def update_scan_session(session: dict, **fields) -> None:
+    """
+    Merge arbitrary metadata into a session and persist it.
+
+    Used by callers that need context to survive an interruption — the regions
+    scanned, the discovered service list, the account the run targeted — so a
+    resumed run can still produce a complete report. Keys beginning with an
+    underscore stay in-memory only (see ``_write_scan_session``).
+
+    Args:
+        session: Session dict from start_scan_session()
+        **fields: Metadata keys to set on the session
+    """
+    session.update(fields)
     _write_scan_session(session)
