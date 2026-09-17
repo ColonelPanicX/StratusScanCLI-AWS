@@ -1,6 +1,6 @@
 # StratusScanCLI-AWS
 
-[![Version: 0.7.1](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/ColonelPanicX/StratusScanCLI-AWS/releases)
+[![Version: 0.8.0](https://img.shields.io/badge/version-0.8.0-blue.svg)](https://github.com/ColonelPanicX/StratusScanCLI-AWS/releases)
 [![Status: Beta](https://img.shields.io/badge/status-beta-yellow.svg)](#project-status)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
@@ -388,11 +388,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the exporter script template and cont
 
 ## Project Status
 
-**Current version: 0.7.1-beta**
+**Current version: 0.8.0-beta**
 
 StratusScanCLI-AWS is in active beta development. The API and output format may change before the 1.0.0 stable release. All active development occurs on the `dev` branch; `main` is release snapshots only.
 
-### What's new in v0.7.0
+### What's new in v0.8.0
+
+- **Pricing rates now come from AWS, not a bundled guess**: Cost estimates are sourced from AWS's public Price List Bulk feed — fetched at runtime when reachable, cached by feed version, and falling back to a bundled snapshot otherwise. An audit found that 80% of the previous EC2 commercial records had been synthesized from a per-family base rate rather than retrieved, averaging 8.6% above published rates; GovCloud rates were accurate. `reference/ec2-pricing.json` is regenerated from the feed and now agrees with it on every field (1,403/1,403 records), which also corrected 90 vCPU and 155 memory values that had served as the authoritative instance-spec source. Rates are never derived: no multipliers, no scaling across sizes, no computing Windows from Linux. A type with no feed row reports N/A instead of a fabricated number (48 types, including dedicated-host-only EC2 Mac and sizes that do not exist). Capacity Block rows priced at $0.00 no longer shadow real on-demand rates — one GPU type would have exported at $0.00/month instead of $83,171. The `Cost Note` column records which source priced each row. `tools/refresh_pricing.py` regenerates snapshots; hand-editing is out (#296, #297).
+- **Billing export corrected**: The Cost Explorer query now follows pagination instead of reading only the first page, and accumulates costs per month and service rather than overwriting them. `TimePeriod.End` is exclusive, so every prior export silently dropped the final day of its last month — fixed. The metric moved from `BlendedCost`, which averages rates across a consolidated billing family, to `NetUnblendedCost`, which reflects what an account was actually charged. "Last 12 months" now spans 12 calendar months rather than 13. A new `About` sheet records the metric, period, account and tool version, and missing Cost Explorer permissions or a GovCloud run now leave a visible skip marker workbook instead of nothing at all. **Behavior change:** totals are higher and differently allocated than prior exports; earlier billing workbooks are not comparable (#289).
+- **Service Discovery archives explain themselves**: Sweep archives land in `output/service-discovery/` instead of alongside one-off exports, and each zip now carries a Markdown scan report — services in use, what ran, what was skipped and why, missing prior outputs, and the bill cross-check. A recipient holding the archive can tell what happened without the operator's terminal. Resumed sessions now archive the whole session rather than only the scripts from the resumed run, and no longer re-prompt for regions (#291, #294).
+- **RDS deployment placement**: `Status`, `Multi-AZ` and `Availability Zone(s)` columns, read from responses the exporter already fetched — no new API calls or IAM. Cluster members report their own Availability Zone; the cluster's `AvailabilityZones` list is deliberately not exported, since it records where instances *can* be created rather than where they run (#292).
+
+### Previously in v0.7.0
 
 - **Unattended audit mode (manual half)**: The pieces needed to run a full audit without a human at the keyboard. `--run-all` executes every exporter in one headless pass and writes a spreadsheet run report; `--org-scan` extends that across every account in an AWS Organization via `--scan-role`; exports can be delivered straight to S3 instead of the local `output/` directory; and each run emits a manifest recording what ran, what it found, and what failed. Empty exports are suppressed by default — an exporter that finds nothing writes no spreadsheet, but the run report still records it as "ran, 0 assets" (#175, #199, #202, #203, #204).
 - **One interaction voice across the CLI**: Every interactive surface — menus, multi-selects, confirmations, the config wizards — now speaks a single contract. Numbered `1..N` menus, `b` = back / `x` = main menu / `q` = quit everywhere, two-tier confirmations, and consistent ✅/❌ status glyphs. This replaces five competing prompt dialects that had accumulated across the codebase; the Cost Management all-in-one menu in particular no longer changes input style between steps. Three latent bugs surfaced and were fixed in the process: the Cost bundle silently skipped Compute Optimizer, Smart Scan ran everything when `questionary` was absent instead of offering a real fallback, and the services-in-use exporter ignored the region back/exit signal (#252).

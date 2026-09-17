@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stratusscancli-aws"
-version = "0.7.1-beta"
+version = "0.8.0-beta"
 description = "AWS defensive security scanning and auditing tool for resource exports"
 readme = "README.md"
 requires-python = ">=3.10"
