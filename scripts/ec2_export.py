@@ -203,8 +203,16 @@ def format_tags(tags):
 
 def load_pricing_data(region='us-east-1'):
     """
-    Load EC2 pricing data from the reference JSON file.
-    Selects the correct pricing block based on the region's partition.
+    Load EC2 pricing rates and their provenance.
+
+    Rates come from AWS's published Price List Bulk feed via
+    ``utils.get_pricing_data`` -- fetched live when the feed is reachable,
+    replayed from a version-keyed cache when it is fresh, and read from the
+    bundled reference/ snapshot otherwise. One code path, so the fallback
+    cannot drift from the live data (Issue #297).
+
+    The pricing block is selected by partition, never computed from the other:
+    GovCloud rates are pulled from the GovCloud feed.
 
     Args:
         region (str): AWS region being scanned, used to detect partition and
@@ -212,25 +220,26 @@ def load_pricing_data(region='us-east-1'):
                       commercial, us-gov-west-1 for GovCloud).
 
     Returns:
-        dict: {instance_type: {'linux': float|None, 'windows': float|None,
-                                'memory_gib': float|None}}
+        tuple: ``(pricing_data, provenance)`` where pricing_data is
+        ``{instance_type: {'linux': float|None, 'windows': float|None,
+        'memory_gib': float|None}}``.
     """
     pricing_data = {}
+    records, provenance = utils.get_pricing_data('AmazonEC2')
+
+    if not records:
+        utils.log_warning(
+            "No EC2 pricing records available "
+            f"({provenance.get('fallback_reason', 'unknown reason')}) - "
+            "cost columns will read N/A"
+        )
+        return pricing_data, provenance
+
     try:
-        script_dir = Path(__file__).parent.absolute()
-        pricing_file = script_dir.parent / 'reference' / 'ec2-pricing.json'
-
-        if not pricing_file.exists():
-            utils.log_warning(f"Pricing file not found at {pricing_file}")
-            return pricing_data
-
-        with open(pricing_file, encoding='utf-8') as f:
-            json_data = json.load(f)
-
         partition = utils.detect_partition(region)
         pricing_region = 'us-gov-west-1' if partition == 'aws-us-gov' else 'us-east-1'
 
-        for instance_type, data in json_data.get('records', {}).items():
+        for instance_type, data in records.items():
             regional = (
                 data.get('pricing', {}).get(pricing_region)
                 or data.get('pricing', {}).get('us-east-1', {})
@@ -243,13 +252,13 @@ def load_pricing_data(region='us-east-1'):
 
         utils.log_info(
             f"Loaded pricing data for {len(pricing_data)} instance types "
-            f"({pricing_region} pricing)"
+            f"({pricing_region} pricing; {utils.pricing_provenance_note(provenance)})"
         )
-        return pricing_data
+        return pricing_data, provenance
 
     except Exception as e:
         utils.log_warning(f"Error loading pricing data: {e}")
-        return pricing_data
+        return pricing_data, provenance
 
 def load_storage_pricing_data():
     """
@@ -606,7 +615,7 @@ def get_instance_data(region, instance_filter=None):
     instances = []
 
     # Load pricing data
-    pricing_data = load_pricing_data(region)
+    pricing_data, pricing_provenance = load_pricing_data(region)
     storage_pricing = load_storage_pricing_data()
 
     # Prepare filters if needed
@@ -692,11 +701,14 @@ def get_instance_data(region, instance_filter=None):
             except Exception as e:
                 utils.log_warning(f"Error fetching instance types in {region}: {e}")
 
+    # The pricing source belongs in the workbook, not only in a docstring.
+    # Issue #296 sat undetected for seven months because a Cost Note said
+    # "Estimate (us-east-1 pricing)" whether the rate was retrieved or invented.
     _partition = utils.detect_partition(region)
+    _pricing_region = 'us-gov-west-1' if _partition == 'aws-us-gov' else 'us-east-1'
     cost_note = (
-        "Estimate (us-gov-west-1 pricing)"
-        if _partition == 'aws-us-gov'
-        else "Estimate (us-east-1 pricing)"
+        f"Estimate ({_pricing_region} pricing; "
+        f"{utils.pricing_provenance_note(pricing_provenance)})"
     )
 
     # Process each instance. One malformed instance must not sink the region,

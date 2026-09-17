@@ -4559,6 +4559,101 @@ def _load_pricing_json(filename: str, default: dict[str, float]) -> dict[str, fl
     return default
 
 
+# =============================================================================
+# PRICING FEED ACCESS (Issue #297)
+# =============================================================================
+
+
+def _pricing_settings() -> dict[str, Any]:
+    """
+    Read the ``pricing`` block of advanced settings, with defaults for gaps.
+
+    Defaults live in ``pricing_feed`` so the module is usable without a
+    config.json at all -- a fresh CloudShell session has none until the wizard
+    runs.
+    """
+    import pricing_feed
+
+    defaults = {
+        "live_feed_enabled": pricing_feed.DEFAULT_LIVE_FEED_ENABLED,
+        "cache_ttl_hours": pricing_feed.DEFAULT_CACHE_TTL_HOURS,
+        "max_feed_bytes": pricing_feed.DEFAULT_MAX_FEED_BYTES,
+        "timeout_seconds": pricing_feed.DEFAULT_TIMEOUT_SECONDS,
+        "max_seconds": pricing_feed.DEFAULT_MAX_SECONDS,
+    }
+    try:
+        configured = config_value("pricing", {}, section="advanced_settings") or {}
+        if isinstance(configured, dict):
+            defaults.update({k: v for k, v in configured.items() if k in defaults})
+    except Exception as exc:  # noqa: BLE001 - settings must never block an export
+        logging.getLogger(__name__).warning(
+            "Could not read pricing advanced settings (%s) - using defaults", exc
+        )
+    return defaults
+
+
+def get_pricing_data(offer_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Return ``(records, provenance)`` for one AWS offer code.
+
+    The one pricing entry point for exporters. Serves the live AWS Price List
+    Bulk feed when it is reachable, a version-keyed local cache when it is
+    fresh, and the bundled ``reference/`` snapshot otherwise -- all through a
+    single code path, so the three differ only in what ``provenance`` reports.
+
+    No value returned here is derived. Every rate came from a feed row, in the
+    live case and the bundled case alike, because both are produced by the same
+    extractor (see ``pricing_feed.extract_ec2_records`` and
+    ``tools/refresh_pricing.py``).
+
+    A fetch failure of any kind -- no egress, blocked DNS, proxy denial,
+    timeout, oversized feed -- is not an error. It falls back, records the
+    reason in provenance, and the export proceeds.
+
+    Args:
+        offer_code: AWS offer code, e.g. ``"AmazonEC2"``.
+
+    Returns:
+        ``(records, provenance)``. ``records`` is empty only when the bundled
+        snapshot is also unreadable; provenance then reports
+        ``source='unavailable'``. Callers must not read an empty map as
+        "nothing costs anything".
+    """
+    import pricing_feed
+
+    settings = _pricing_settings()
+    try:
+        return pricing_feed.get_pricing(
+            offer_code,
+            live_feed_enabled=bool(settings["live_feed_enabled"]),
+            cache_ttl_hours=float(settings["cache_ttl_hours"]),
+            max_feed_bytes=int(settings["max_feed_bytes"]),
+            timeout_seconds=float(settings["timeout_seconds"]),
+            max_seconds=float(settings["max_seconds"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - pricing must never sink an export
+        logging.getLogger(__name__).warning(
+            "Pricing lookup for %s failed entirely: %s", offer_code, exc
+        )
+        return {}, {
+            "source": pricing_feed.SOURCE_UNAVAILABLE,
+            "fallback_reason": "pricing lookup raised",
+        }
+
+
+def pricing_provenance_note(provenance: dict[str, Any]) -> str:
+    """
+    Render a provenance block as one phrase for a workbook's ``Cost Note``.
+
+    Exporters append this to their existing cost note so a reader can tell, per
+    row, whether a figure came from a live feed version or a bundled snapshot.
+    Issue #296 went unnoticed for seven months because no export said.
+    """
+    import pricing_feed
+
+    return pricing_feed.provenance_note(provenance or {})
+
+
 _INSTANCE_SPECS_LOCK = threading.Lock()
 _INSTANCE_SPECS_CACHE: Optional[dict[str, dict[str, Any]]] = None
 
