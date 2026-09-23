@@ -45,19 +45,19 @@ class TestAccountMapping:
 
     def test_get_account_name_with_mapping(self):
         """Test retrieval of account name when mapping exists."""
-        with patch.object(utils, 'ACCOUNT_MAPPINGS', {'123456789012': 'PROD-ACCOUNT'}):
+        with patch.object(utils, 'get_config', return_value=({'123456789012': 'PROD-ACCOUNT'}, {})):
             result = utils.get_account_name('123456789012')
             assert result == 'PROD-ACCOUNT'
 
     def test_get_account_name_with_default(self):
         """Test fallback to default when no mapping exists."""
-        with patch.object(utils, 'ACCOUNT_MAPPINGS', {}):
+        with patch.object(utils, 'get_config', return_value=({}, {})):
             result = utils.get_account_name('999999999999', default='TEST-DEFAULT')
             assert result == 'TEST-DEFAULT'
 
     def test_get_account_name_default_fallback(self):
         """Test default fallback value is used."""
-        with patch.object(utils, 'ACCOUNT_MAPPINGS', {}):
+        with patch.object(utils, 'get_config', return_value=({}, {})):
             result = utils.get_account_name('999999999999')
             assert result == 'UNKNOWN-ACCOUNT'
 
@@ -145,7 +145,7 @@ class TestAccountInfo:
         mock_get_client.return_value = mock_sts
 
         with patch.object(utils, '_account_info_cache', None), \
-             patch.object(utils, 'ACCOUNT_MAPPINGS', {'123456789012': 'TEST-ACCOUNT'}):
+             patch.object(utils, 'get_config', return_value=({'123456789012': 'TEST-ACCOUNT'}, {})):
             account_id, account_name = utils.get_account_info()
             assert account_id == '123456789012'
             assert account_name == 'TEST-ACCOUNT'
@@ -162,7 +162,7 @@ class TestAccountInfo:
         mock_get_client.return_value = mock_sts
 
         with patch.object(utils, '_account_info_cache', None), \
-             patch.object(utils, 'ACCOUNT_MAPPINGS', {}):
+             patch.object(utils, 'get_config', return_value=({}, {})):
             account_id, account_name = utils.get_account_info()
             assert account_id == '999999999999'
             assert '999999999999' in account_name
