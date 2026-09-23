@@ -299,7 +299,7 @@ class TestSummaryContract:
 
     def test_sheet_order(self, patch_output_dir):
         wb = load_workbook(self._report())
-        assert wb.sheetnames == ["Summary", "About", "Jul 2026", "Aug 2026"]
+        assert wb.sheetnames == ["Summary", "About", "Savings Plans", "Jul 2026", "Aug 2026"]
 
     def test_about_sheet(self, patch_output_dir, monkeypatch):
         monkeypatch.setattr(billing_export.utils, "get_version", lambda: "9.9.9-test")
@@ -311,6 +311,7 @@ class TestSummaryContract:
             "Account ID", "Account Name", "Cost Metric", "Metric Meaning",
             "Period Start (inclusive)", "Period End (inclusive)", "Generated",
             "Tool Version", "Data Scope", "Org Caveat", "GovCloud Note",
+            "Invoice Caveat", "API Cost Note",
         ]
         assert about["Account ID"] == "123456789012"
         assert about["Account Name"] == "TEST-ACCOUNT"
@@ -320,6 +321,11 @@ class TestSummaryContract:
         assert about["Tool Version"] == "9.9.9-test"
         for key in ("Metric Meaning", "Generated", "Data Scope", "Org Caveat", "GovCloud Note"):
             assert about[key]
+        assert about["Invoice Caveat"] == billing_export.INVOICE_CAVEAT
+        assert "reseller" in about["Invoice Caveat"]
+        assert "cannot see that invoice" in about["Invoice Caveat"]
+        assert "paginated Cost Explorer API request" in about["API Cost Note"]
+        assert "RECORD_TYPE" in about["API Cost Note"]
 
     def test_month_sheets_unchanged(self, patch_output_dir):
         wb = load_workbook(self._report())
@@ -528,8 +534,8 @@ class TestTwelveMonthReport:
             account_id="123456789012", start_date=start, end_date=end,
         )
         wb = load_workbook(path)
-        month_sheets = wb.sheetnames[2:]
-        assert wb.sheetnames[:2] == ["Summary", "About"]
+        month_sheets = wb.sheetnames[3:]
+        assert wb.sheetnames[:3] == ["Summary", "About", "Savings Plans"]
         assert len(month_sheets) == 12
         assert month_sheets[0] == "Jan 2025" and month_sheets[-1] == "Dec 2025"
 
@@ -543,3 +549,254 @@ class TestTwelveMonthReport:
         about = dict(list(wb["About"].iter_rows(values_only=True))[1:])
         assert about["Period Start (inclusive)"] == "2025-01-01"
         assert about["Period End (inclusive)"] == "2025-12-31"
+
+
+# --- Savings Plans breakdown (Issue #300) ---------------------------------
+
+def _rt_request(start, end, token=None):
+    req = {
+        "TimePeriod": {"Start": start, "End": end},
+        "Granularity": "MONTHLY",
+        "Metrics": [billing_export.COST_METRIC],
+        "GroupBy": [{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
+    }
+    if token:
+        req["NextPageToken"] = token
+    return req
+
+
+def _sp_status_block(ws):
+    """(Field, Value) rows above the first blank row."""
+    block = {}
+    for row in ws.iter_rows(values_only=True):
+        if row[0] is None:
+            break
+        block.setdefault(row[0], row[1])
+    return block
+
+
+def _sp_table(ws):
+    rows = list(ws.iter_rows(values_only=True))
+    start = next(i for i, r in enumerate(rows) if r[0] == "Month")
+    return rows[start:]
+
+
+class TestRecordTypeBreakdown:
+    def test_multi_page_aggregation(self, monkeypatch):
+        _, stubber = _stubbed_ce(monkeypatch)
+        start, end = "2026-07-01", "2026-09-01"
+        stubber.add_response(
+            "get_cost_and_usage",
+            {
+                "ResultsByTime": [
+                    _result("2026-07-01", "2026-08-01", [
+                        _group("Usage", "40.00"),
+                        _group("SavingsPlanCoveredUsage", "100.00"),
+                        _group("SavingsPlanNegation", "-100.00"),
+                    ]),
+                    _result("2026-08-01", "2026-09-01", [
+                        _group("SavingsPlanCoveredUsage", "60.00"),
+                        _group("SavingsPlanRecurringFee", "30.00"),
+                    ]),
+                ],
+                "NextPageToken": "p2",
+            },
+            _rt_request(start, end),
+        )
+        stubber.add_response(
+            "get_cost_and_usage",
+            {
+                "ResultsByTime": [
+                    _result("2026-08-01", "2026-09-01", [
+                        _group("SavingsPlanCoveredUsage", "40.00"),
+                        _group("SavingsPlanNegation", "-100.00"),
+                        _group("SavingsPlanRecurringFee", "12.50"),
+                        _group("SavingsPlanUpfrontFee", "5.00"),
+                    ]),
+                ],
+            },
+            _rt_request(start, end, "p2"),
+        )
+        with stubber:
+            data = billing_export.get_record_type_breakdown(
+                datetime.datetime(2026, 7, 1), datetime.datetime(2026, 9, 1)
+            )
+            stubber.assert_no_pending_responses()
+
+        assert data["2026-07"] == {
+            "Usage": pytest.approx(40.0),
+            "SavingsPlanCoveredUsage": pytest.approx(100.0),
+            "SavingsPlanNegation": pytest.approx(-100.0),
+        }
+        aug = data["2026-08"]
+        assert aug["SavingsPlanCoveredUsage"] == pytest.approx(100.0)
+        assert aug["SavingsPlanRecurringFee"] == pytest.approx(42.5)
+        assert aug["SavingsPlanNegation"] == pytest.approx(-100.0)
+        assert aug["SavingsPlanUpfrontFee"] == pytest.approx(5.0)
+
+        sp = billing_export.summarize_savings_plans(data)
+        assert sp["status"] == billing_export.SP_STATUS_FOUND
+        assert sp["months"]["2026-07"]["SavingsPlanRecurringFee"] == 0.0
+        assert sp["unrecognized"] == {}
+
+    def test_empty_month_is_kept(self, monkeypatch):
+        _, stubber = _stubbed_ce(monkeypatch)
+        stubber.add_response(
+            "get_cost_and_usage",
+            {"ResultsByTime": [_result("2026-08-01", "2026-09-01", [])]},
+            _rt_request("2026-08-01", "2026-09-01"),
+        )
+        with stubber:
+            data = billing_export.get_record_type_breakdown(
+                datetime.datetime(2026, 8, 1), datetime.datetime(2026, 9, 1)
+            )
+        assert data == {"2026-08": {}}
+
+
+class TestSummarizeSavingsPlans:
+    def test_no_sp_record_types_is_none_state(self):
+        sp = billing_export.summarize_savings_plans({
+            "2026-08": {"Usage": 10.0, "Tax": 1.0, "Credit": -2.0},
+        })
+        assert sp["status"] == billing_export.SP_STATUS_NONE
+
+    def test_empty_breakdown_is_none_state(self):
+        assert billing_export.summarize_savings_plans({})["status"] == billing_export.SP_STATUS_NONE
+
+    def test_console_spelling_matches(self):
+        sp = billing_export.summarize_savings_plans({
+            "2026-08": {"Savings Plan Covered Usage": 5.0, "savings plan negation": -5.0},
+        })
+        assert sp["status"] == billing_export.SP_STATUS_FOUND
+        row = sp["months"]["2026-08"]
+        assert row["SavingsPlanCoveredUsage"] == 5.0
+        assert row["SavingsPlanNegation"] == -5.0
+
+    def test_unrecognized_sp_type_reported_not_netted(self):
+        sp = billing_export.summarize_savings_plans({
+            "2026-08": {"SavingsPlanSomethingNew": 7.0, "Usage": 1.0},
+        })
+        assert sp["status"] == billing_export.SP_STATUS_FOUND
+        assert sp["unrecognized"] == {"SavingsPlanSomethingNew": 7.0}
+        assert sum(sp["months"]["2026-08"].values()) == 0.0
+
+
+class TestSavingsPlansSheet:
+    DATA = {"2026-08": {"Amazon EC2": 50.0}}
+
+    def _report(self, sp_result):
+        path = billing_export.create_excel_report(
+            self.DATA, "TEST-ACCOUNT", "08-2026",
+            account_id="123456789012",
+            start_date=datetime.datetime(2026, 8, 1),
+            end_date=datetime.datetime(2026, 9, 1),
+            sp_result=sp_result,
+        )
+        return load_workbook(path)["Savings Plans"]
+
+    def test_records_table(self, patch_output_dir):
+        sp = billing_export.summarize_savings_plans({
+            "2026-07": {"Usage": 3.0},
+            "2026-08": {
+                "SavingsPlanCoveredUsage": 100.0,
+                "SavingsPlanNegation": -100.0,
+                "SavingsPlanRecurringFee": 42.5,
+                "SavingsPlanUpfrontFee": 5.0,
+            },
+        })
+        ws = self._report(sp)
+        block = _sp_status_block(ws)
+        assert block["Status"] == billing_export.SP_STATUS_FOUND
+        assert block["Caveat"] == billing_export.SP_ABSENCE_CAVEAT
+        table = _sp_table(ws)
+        assert table[0] == (
+            "Month", "Covered Usage (USD)", "Negation (USD)",
+            "Recurring Fee (USD)", "Upfront Fee (USD)", "Net (USD)",
+        )
+        assert table[1] == ("July 2026", 0.0, 0.0, 0.0, 0.0, 0.0)
+        assert table[2][0] == "August 2026"
+        assert table[2][1:] == (
+            pytest.approx(100.0), pytest.approx(-100.0), pytest.approx(42.5),
+            pytest.approx(5.0), pytest.approx(47.5),
+        )
+        assert table[-1][0] == "Total"
+        assert table[-1][-1] == pytest.approx(47.5)
+
+    def test_no_records_state_is_explicit(self, patch_output_dir):
+        ws = self._report(billing_export.summarize_savings_plans({"2026-08": {"Usage": 50.0}}))
+        block = _sp_status_block(ws)
+        assert block["Status"] == "NO RECORDS"
+        assert block["Detail"] == (
+            "No Savings Plans records in this account's Cost Explorer data for this period."
+        )
+        assert "another account" in block["Caveat"] and "reseller" in block["Caveat"]
+        values = list(ws.iter_rows(values_only=True))
+        assert not any(r[0] == "Month" for r in values), "no zeroed table in the empty state"
+
+    def test_failed_state_distinct_from_none(self, patch_output_dir):
+        err = billing_export.ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "GetCostAndUsage",
+        )
+        ws = self._report(billing_export.savings_plans_failure(err))
+        block = _sp_status_block(ws)
+        assert block["Status"] == "LOOKUP FAILED"
+        assert block["Status"] != billing_export.SP_STATUS_NONE
+        assert "UNKNOWN" in block["Detail"] and "not the same as 'no records'" in block["Detail"]
+        assert block["Error Code"] == "AccessDeniedException"
+        assert block["Error Message"] == "denied"
+
+    def test_none_result_renders_as_failed_not_empty(self, patch_output_dir):
+        block = _sp_status_block(self._report(None))
+        assert block["Status"] == billing_export.SP_STATUS_FAILED
+        assert block["Error Code"] == "NotQueried"
+
+
+class TestMainSavingsPlansFailure:
+    """Breakdown query failure must not fail the main billing export."""
+
+    def _run_main(self, monkeypatch, sp_error_code):
+        _, stubber = _stubbed_ce(monkeypatch)
+        with _frozen_now(datetime.datetime(2026, 9, 15, 12, 0)):
+            _, _, start, end = billing_export.validate_date_input("last 12")
+        s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        stubber.add_response(
+            "get_cost_and_usage",
+            {"ResultsByTime": [_result("2026-08-01", "2026-09-01", [_group("Amazon EC2", "9.00")])]},
+            _base_request(s, e),
+        )
+        stubber.add_client_error(
+            "get_cost_and_usage",
+            service_error_code=sp_error_code,
+            service_message="breakdown failed",
+            http_status_code=400,
+            expected_params=_rt_request(s, e),
+        )
+        utils = billing_export.utils
+        monkeypatch.setattr(utils, "detect_partition", lambda *a, **k: "aws")
+        monkeypatch.setattr(utils, "print_script_banner", lambda *a, **k: ("123456789012", "TEST-ACCOUNT"))
+        monkeypatch.setattr(utils, "ensure_dependencies", lambda *a, **k: True)
+        monkeypatch.setattr(utils, "is_auto_run", lambda: True)
+        warnings = []
+        monkeypatch.setattr(utils, "log_warning", lambda msg: warnings.append(msg))
+
+        with _frozen_now(datetime.datetime(2026, 9, 15, 12, 0)), stubber:
+            billing_export.main()
+            stubber.assert_no_pending_responses()
+        return warnings
+
+    @pytest.mark.parametrize("code", ["AccessDeniedException", "DataUnavailableException"])
+    def test_export_succeeds_and_sheet_records_failure(self, monkeypatch, patch_output_dir, code):
+        warnings = self._run_main(monkeypatch, code)
+        assert any("Savings Plans breakdown lookup failed" in w and code in w for w in warnings)
+
+        files = list(patch_output_dir.glob("*.xlsx"))
+        assert len(files) == 1
+        assert fnmatch.fnmatch(files[0].name, REAL_EXPORT_GLOB)
+        wb = load_workbook(files[0])
+        assert wb.sheetnames[:3] == ["Summary", "About", "Savings Plans"]
+        summary = list(wb["Summary"].iter_rows(values_only=True))
+        assert summary[-1] == ("Total All Months", pytest.approx(9.0))
+        block = _sp_status_block(wb["Savings Plans"])
+        assert block["Status"] == billing_export.SP_STATUS_FAILED
+        assert block["Error Code"] == code

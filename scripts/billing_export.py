@@ -88,6 +88,63 @@ GOVCLOUD_NOTE = (
     "and is combined into that account's usage reports. Run from that associated "
     "account, these figures may include GovCloud spend; it is not separated out here."
 )
+INVOICE_CAVEAT = (
+    "These totals are what AWS reports to this account's Cost Explorer. If this "
+    "account is billed through a reseller, the invoice comes from the reseller and "
+    "may differ from these figures; this export cannot see that invoice."
+)
+API_COST_NOTE = (
+    "AWS bills each paginated Cost Explorer API request. This export makes two "
+    "GetCostAndUsage queries (grouped by SERVICE and by RECORD_TYPE), each one or "
+    "more paginated requests."
+)
+
+# Savings Plans breakdown (second GetCostAndUsage query, grouped by
+# RECORD_TYPE). RECORD_TYPE is a documented GroupBy DIMENSION key for
+# GetCostAndUsage (API reference, GetCostAndUsage > GroupBy). The four API
+# values below are from the Cost Categories "Term comparisons" table, which
+# maps CHARGE_TYPE to "the RECORD_TYPE value in the Cost Explorer API"
+# (Billing user guide, manage-cost-categories). Grouped by SERVICE, covered
+# usage and its negation land in the same row and cancel, so this is the only
+# place the breakdown shows.
+SP_SHEET = 'Savings Plans'
+SP_RECORD_TYPES = (
+    ('SavingsPlanCoveredUsage', 'Covered Usage (USD)'),
+    ('SavingsPlanNegation', 'Negation (USD)'),
+    ('SavingsPlanRecurringFee', 'Recurring Fee (USD)'),
+    ('SavingsPlanUpfrontFee', 'Upfront Fee (USD)'),
+)
+SP_STATUS_FOUND = 'RECORDS FOUND'
+SP_STATUS_NONE = 'NO RECORDS'
+SP_STATUS_FAILED = 'LOOKUP FAILED'
+SP_NO_RECORDS_DETAIL = (
+    "No Savings Plans records in this account's Cost Explorer data for this period."
+)
+SP_ABSENCE_CAVEAT = (
+    "Absence of Savings Plans records cannot distinguish 'this account has no "
+    "Savings Plans' from 'a Savings Plan is held by another account in the "
+    "organization or by a reseller', whose records may not appear in this "
+    "account's Cost Explorer data."
+)
+SP_METRIC_NOTE = (
+    f"Amounts use the same metric as the rest of this workbook ({COST_METRIC}). "
+    "Net is the sum of the four columns."
+)
+
+
+def _normalize_record_type(value):
+    """Case/space/separator-insensitive form of a RECORD_TYPE value.
+
+    The documented API values are CamelCase ('SavingsPlanNegation'); the
+    console spells them with spaces ('Savings Plan Negation'). Matching on the
+    normalized form accepts either, so a spelling difference in live
+    GetCostAndUsage group keys cannot silently zero the sheet.
+    """
+    return re.sub(r'[\s_\-]', '', str(value)).lower()
+
+
+_SP_CANONICAL = {_normalize_record_type(api): api for api, _ in SP_RECORD_TYPES}
+_SP_PREFIX = _normalize_record_type('SavingsPlan')
 
 
 class BillingPermissionDenied(Exception):
@@ -291,6 +348,193 @@ def get_billing_data(start_date, end_date):
             sys.exit(1)
 
 
+def get_record_type_breakdown(start_date, end_date):
+    """
+    Monthly totals per RECORD_TYPE from Cost Explorer.
+
+    Same TimePeriod, Granularity and COST_METRIC as get_billing_data(), so the
+    two queries describe the same money. Follows NextPageToken until exhausted
+    and sums a (month, record type) pair split across pages.
+
+    Args:
+        start_date (datetime): Start date (inclusive)
+        end_date (datetime): End date (exclusive, per the TimePeriod contract)
+
+    Returns:
+        dict: {'YYYY-MM': {record_type: amount}}. Every month Cost Explorer
+        returned is present, even one with no groups.
+
+    Raises:
+        ClientError / BotoCoreError / KeyError / ValueError: caller decides;
+        a failure here must not fail the main billing export.
+    """
+    ce_client = utils.get_boto3_client('ce')
+    breakdown = {}
+    next_token = None
+
+    while True:
+        params = {
+            'TimePeriod': {
+                'Start': start_date.strftime('%Y-%m-%d'),
+                'End': end_date.strftime('%Y-%m-%d'),
+            },
+            'Granularity': 'MONTHLY',
+            'Metrics': [COST_METRIC],
+            'GroupBy': [
+                {
+                    'Type': 'DIMENSION',
+                    'Key': 'RECORD_TYPE'
+                }
+            ]
+        }
+        if next_token:
+            params['NextPageToken'] = next_token
+
+        response = ce_client.get_cost_and_usage(**params)
+
+        for result in response.get('ResultsByTime', []):
+            period_start = result['TimePeriod']['Start']
+            month = datetime.datetime.strptime(period_start, '%Y-%m-%d').strftime('%Y-%m')
+            month_data = breakdown.setdefault(month, {})
+            for group in result.get('Groups', []):
+                record_type = group['Keys'][0]
+                amount = float(group['Metrics'][COST_METRIC]['Amount'])
+                month_data[record_type] = month_data.get(record_type, 0.0) + amount
+
+        next_token = response.get('NextPageToken')
+        if not next_token:
+            break
+
+    return breakdown
+
+
+def summarize_savings_plans(breakdown):
+    """
+    Reduce a RECORD_TYPE breakdown to the Savings Plans sheet model.
+
+    Args:
+        breakdown (dict): output of get_record_type_breakdown()
+
+    Returns:
+        dict with keys:
+            'status': SP_STATUS_FOUND or SP_STATUS_NONE
+            'months': {'YYYY-MM': {api_record_type: amount}} for every month
+                      in the breakdown (zeros where a month has no SP records)
+            'unrecognized': {raw_record_type: amount} for record types that
+                      start with 'Savings Plan' but are not one of the four
+                      documented values. Reported, never folded into Net.
+    """
+    months = {}
+    unrecognized = {}
+    found = False
+    for month in sorted(breakdown):
+        row = {api: 0.0 for api, _ in SP_RECORD_TYPES}
+        for record_type, amount in breakdown[month].items():
+            norm = _normalize_record_type(record_type)
+            if norm in _SP_CANONICAL:
+                row[_SP_CANONICAL[norm]] += amount
+                found = True
+            elif norm.startswith(_SP_PREFIX):
+                unrecognized[record_type] = unrecognized.get(record_type, 0.0) + amount
+                found = True
+        months[month] = row
+    return {
+        'status': SP_STATUS_FOUND if found else SP_STATUS_NONE,
+        'months': months,
+        'unrecognized': unrecognized,
+    }
+
+
+def savings_plans_failure(error):
+    """Sheet model for a breakdown query that raised."""
+    if isinstance(error, ClientError):
+        code = error.response.get('Error', {}).get('Code', '') or type(error).__name__
+        message = error.response.get('Error', {}).get('Message', str(error))
+    else:
+        code, message = type(error).__name__, str(error)
+    return {'status': SP_STATUS_FAILED, 'error_code': code, 'error_message': message}
+
+
+def write_savings_plans_sheet(ws, sp_result, header_font, header_fill):
+    """
+    Fill the Savings Plans sheet.
+
+    Layout: a status block (Status / Detail / Caveat / Metric), a blank row,
+    then -- only when records exist -- the monthly table with a Total row.
+    The status block is always present so an empty or failed lookup is stated,
+    never shown as a blank or zeroed table.
+    """
+    if sp_result is None:
+        sp_result = {
+            'status': SP_STATUS_FAILED,
+            'error_code': 'NotQueried',
+            'error_message': 'The Savings Plans breakdown was not queried for this workbook.',
+        }
+
+    status = sp_result['status']
+    rows = [('Status', status)]
+    if status == SP_STATUS_FAILED:
+        rows.append(('Detail',
+                     "The Savings Plans breakdown query failed, so whether Savings Plans "
+                     "records exist is UNKNOWN. This is not the same as 'no records'. "
+                     "The service totals on the other sheets are unaffected."))
+        rows.append(('Error Code', sp_result.get('error_code', '')))
+        rows.append(('Error Message', sp_result.get('error_message', '')))
+        rows.append(('Required Permission', 'ce:GetCostAndUsage'))
+    elif status == SP_STATUS_NONE:
+        rows.append(('Detail', SP_NO_RECORDS_DETAIL))
+    else:
+        rows.append(('Detail',
+                     "Savings Plans records found in this account's Cost Explorer data. "
+                     "Grouped by service these net out inside each service row; they are "
+                     "broken out here by record type."))
+    rows.append(('Caveat', SP_ABSENCE_CAVEAT))
+    rows.append(('Metric', SP_METRIC_NOTE))
+    for raw, amount in sorted(sp_result.get('unrecognized', {}).items()):
+        rows.append(('Unrecognized Record Type',
+                     f"{raw}: {amount:,.2f} USD over the period. Starts with 'Savings Plan' "
+                     "but is not one of the four documented types; not included in Net."))
+
+    for idx, (field, value) in enumerate(rows, start=1):
+        ws.cell(row=idx, column=1, value=field).font = header_font
+        ws.cell(row=idx, column=2, value=value)
+
+    ws.column_dimensions['A'].width = 26
+    ws.column_dimensions['B'].width = 22
+
+    if status != SP_STATUS_FOUND:
+        ws.column_dimensions['B'].width = 100
+        return
+
+    header_row = len(rows) + 2
+    headers = ['Month'] + [label for _, label in SP_RECORD_TYPES] + ['Net (USD)']
+    for col, label in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col, value=label)
+        cell.font = header_font
+        cell.fill = header_fill
+
+    totals = [0.0] * (len(SP_RECORD_TYPES) + 1)
+    row = header_row + 1
+    for month, values in sorted(sp_result['months'].items()):
+        amounts = [values[api] for api, _ in SP_RECORD_TYPES]
+        amounts.append(sum(amounts))
+        ws.cell(row=row, column=1,
+                value=datetime.datetime.strptime(month, '%Y-%m').strftime('%B %Y'))
+        for col, amount in enumerate(amounts, start=2):
+            cell = ws.cell(row=row, column=col, value=amount)
+            cell.number_format = '$#,##0.00'
+            totals[col - 2] += amount
+        row += 1
+
+    ws.cell(row=row, column=1, value='Total').font = header_font
+    for col, amount in enumerate(totals, start=2):
+        cell = ws.cell(row=row, column=col, value=amount)
+        cell.font = header_font
+        cell.number_format = '$#,##0.00'
+    for col in range(3, len(headers) + 1):
+        ws.column_dimensions[chr(ord('A') + col - 1)].width = 22
+
+
 def write_skip_marker(account_name, suffix, rows):
     """
     Write a small workbook recording that the billing export was skipped.
@@ -354,12 +598,14 @@ def write_govcloud_skip_marker(account_name, account_id):
 
 
 def create_excel_report(billing_data, account_name, date_suffix,
-                        account_id=None, start_date=None, end_date=None):
+                        account_id=None, start_date=None, end_date=None,
+                        sp_result=None):
     """
     Create an Excel report with monthly billing data.
 
     Sheet order: 'Summary' (first, contract unchanged), 'About' (provenance:
-    metric, period, scope caveats), then one sheet per month.
+    metric, period, scope caveats), 'Savings Plans' (record-type breakdown or
+    an explicit no-records / lookup-failed state), then one sheet per month.
 
     Args:
         billing_data (dict): Billing data organized by month and service
@@ -368,6 +614,9 @@ def create_excel_report(billing_data, account_name, date_suffix,
         account_id (str): AWS account ID, shown on the About sheet
         start_date (datetime): Period start (inclusive)
         end_date (datetime): Period end (exclusive, Cost Explorer contract)
+        sp_result (dict): summarize_savings_plans() or savings_plans_failure()
+            output. None is rendered as a failed (not queried) lookup, never
+            as 'no records'.
 
     Returns:
         str: Path to the created Excel file
@@ -397,6 +646,8 @@ def create_excel_report(billing_data, account_name, date_suffix,
     # '%b %Y' (e.g. 'Aug 2026'), which always contains a space and a year, so
     # they cannot collide with 'About'.
     about_sheet = wb.create_sheet(ABOUT_SHEET)
+    sp_sheet = wb.create_sheet(SP_SHEET)
+    write_savings_plans_sheet(sp_sheet, sp_result, header_font, header_fill)
     summary_sheet['A1'] = 'Month'
     summary_sheet['B1'] = 'Total Cost (USD)'
 
@@ -482,6 +733,8 @@ def create_excel_report(billing_data, account_name, date_suffix,
         ('Data Scope', DATA_SCOPE),
         ('Org Caveat', ORG_CAVEAT),
         ('GovCloud Note', GOVCLOUD_NOTE),
+        ('Invoice Caveat', INVOICE_CAVEAT),
+        ('API Cost Note', API_COST_NOTE),
     ]
     about_sheet['A1'] = 'Field'
     about_sheet['B1'] = 'Value'
@@ -621,6 +874,20 @@ def main():
             print("\nNo billing data found for the specified period.")
             sys.exit(0)
 
+        # Savings Plans breakdown. A second paid Cost Explorer request; any
+        # failure is recorded on the sheet and never fails the main export.
+        try:
+            sp_result = summarize_savings_plans(
+                get_record_type_breakdown(start_date, end_date)
+            )
+        except Exception as sp_err:
+            sp_result = savings_plans_failure(sp_err)
+            utils.log_warning(
+                "Savings Plans breakdown lookup failed "
+                f"({sp_result['error_code']}): {sp_result['error_message']}. "
+                "Billing export continues; the Savings Plans sheet records the failure."
+            )
+
         # Determine output file name suffix
         if date_input.lower().startswith('last'):
             date_suffix = "last-12-months"
@@ -631,6 +898,7 @@ def main():
         output_file = create_excel_report(
             billing_data, account_name, date_suffix,
             account_id=account_id, start_date=start_date, end_date=end_date,
+            sp_result=sp_result,
         )
 
         print("\nBilling data export completed successfully.")
