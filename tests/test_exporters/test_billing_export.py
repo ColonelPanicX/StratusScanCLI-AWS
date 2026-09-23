@@ -292,40 +292,11 @@ class TestSummaryContract:
     def _report(self):
         return billing_export.create_excel_report(
             self.DATA, "TEST-ACCOUNT", "last-12-months",
-            account_id="123456789012",
-            start_date=datetime.datetime(2026, 7, 1),
-            end_date=datetime.datetime(2026, 9, 1),
         )
 
     def test_sheet_order(self, patch_output_dir):
         wb = load_workbook(self._report())
-        assert wb.sheetnames == ["Summary", "About", "Savings Plans", "Jul 2026", "Aug 2026"]
-
-    def test_about_sheet(self, patch_output_dir, monkeypatch):
-        monkeypatch.setattr(billing_export.utils, "get_version", lambda: "9.9.9-test")
-        wb = load_workbook(self._report())
-        rows = list(wb["About"].iter_rows(values_only=True))
-        assert rows[0] == ("Field", "Value")
-        about = dict(rows[1:])
-        assert [r[0] for r in rows[1:]] == [
-            "Account ID", "Account Name", "Cost Metric", "Metric Meaning",
-            "Period Start (inclusive)", "Period End (inclusive)", "Generated",
-            "Tool Version", "Data Scope", "Org Caveat", "GovCloud Note",
-            "Invoice Caveat", "API Cost Note",
-        ]
-        assert about["Account ID"] == "123456789012"
-        assert about["Account Name"] == "TEST-ACCOUNT"
-        assert about["Cost Metric"] == "NetUnblendedCost"
-        assert about["Period Start (inclusive)"] == "2026-07-01"
-        assert about["Period End (inclusive)"] == "2026-08-31"
-        assert about["Tool Version"] == "9.9.9-test"
-        for key in ("Metric Meaning", "Generated", "Data Scope", "Org Caveat", "GovCloud Note"):
-            assert about[key]
-        assert about["Invoice Caveat"] == billing_export.INVOICE_CAVEAT
-        assert "reseller" in about["Invoice Caveat"]
-        assert "cannot see that invoice" in about["Invoice Caveat"]
-        assert "paginated Cost Explorer API request" in about["API Cost Note"]
-        assert "RECORD_TYPE" in about["API Cost Note"]
+        assert wb.sheetnames == ["Summary", "Savings Plans", "Jul 2026", "Aug 2026"]
 
     def test_month_sheets_unchanged(self, patch_output_dir):
         wb = load_workbook(self._report())
@@ -334,12 +305,6 @@ class TestSummaryContract:
         assert rows[1] == ("Amazon EC2", pytest.approx(150.75))
         assert rows[2] == ("Amazon S3", pytest.approx(5.75))
         assert rows[-1] == ("Total", pytest.approx(156.5))
-
-    def test_month_sheet_names_cannot_be_about(self):
-        for year in (2000, 2026, 2099):
-            for month in range(1, 13):
-                name = datetime.datetime(year, month, 1).strftime("%b %Y")
-                assert name.lower() != billing_export.ABOUT_SHEET.lower()
 
     def test_summary_sheet_shape(self, patch_output_dir):
         path = self._report()
@@ -531,11 +496,10 @@ class TestTwelveMonthReport:
 
         path = billing_export.create_excel_report(
             data, "TEST-ACCOUNT", "last-12-months",
-            account_id="123456789012", start_date=start, end_date=end,
         )
         wb = load_workbook(path)
-        month_sheets = wb.sheetnames[3:]
-        assert wb.sheetnames[:3] == ["Summary", "About", "Savings Plans"]
+        month_sheets = wb.sheetnames[2:]
+        assert wb.sheetnames[:2] == ["Summary", "Savings Plans"]
         assert len(month_sheets) == 12
         assert month_sheets[0] == "Jan 2025" and month_sheets[-1] == "Dec 2025"
 
@@ -545,10 +509,6 @@ class TestTwelveMonthReport:
         assert rows[1][0] == "January 2025" and rows[12][0] == "December 2025"
         assert rows[-1][0] == "Total All Months"
         assert rows[-1][1] == pytest.approx(12.0)
-
-        about = dict(list(wb["About"].iter_rows(values_only=True))[1:])
-        assert about["Period Start (inclusive)"] == "2025-01-01"
-        assert about["Period End (inclusive)"] == "2025-12-31"
 
 
 # --- Savings Plans breakdown (Issue #300) ---------------------------------
@@ -687,9 +647,6 @@ class TestSavingsPlansSheet:
     def _report(self, sp_result):
         path = billing_export.create_excel_report(
             self.DATA, "TEST-ACCOUNT", "08-2026",
-            account_id="123456789012",
-            start_date=datetime.datetime(2026, 8, 1),
-            end_date=datetime.datetime(2026, 9, 1),
             sp_result=sp_result,
         )
         return load_workbook(path)["Savings Plans"]
@@ -794,7 +751,7 @@ class TestMainSavingsPlansFailure:
         assert len(files) == 1
         assert fnmatch.fnmatch(files[0].name, REAL_EXPORT_GLOB)
         wb = load_workbook(files[0])
-        assert wb.sheetnames[:3] == ["Summary", "About", "Savings Plans"]
+        assert wb.sheetnames[:2] == ["Summary", "Savings Plans"]
         summary = list(wb["Summary"].iter_rows(values_only=True))
         assert summary[-1] == ("Total All Months", pytest.approx(9.0))
         block = _sp_status_block(wb["Savings Plans"])

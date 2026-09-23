@@ -62,43 +62,6 @@ SKIP_MARKER_SUFFIX = 'skipped-no-permission'
 GOVCLOUD_SKIP_MARKER_SUFFIX = 'skipped-govcloud'
 SKIP_MARKER_SHEET = 'Skipped'
 
-ABOUT_SHEET = 'About'
-
-# About-sheet wording. Kept to what AWS documents:
-# - NetUnblendedCost: "reflects the cost after discounts" (Cost Explorer
-#   user guide, ce-advanced). The query applies no RECORD_TYPE filter, so
-#   credit/refund line items visible to this account are in the totals.
-# - Member-account visibility of refunds, credits and discounts is a
-#   management-account Cost Explorer preference (user guide, ce-access).
-# - GovCloud usage is billed through, and reported in, the associated
-#   standard account (GovCloud user guide, usage-and-payment).
-METRIC_MEANING = (
-    "Net unblended cost: AWS defines it as the cost after discounts. No record-type "
-    "filter is applied, so credits and refunds visible to this account are included. "
-    "Closest Cost Explorer metric to the amount actually paid."
-)
-DATA_SCOPE = "Costs visible to this account's Cost Explorer only"
-ORG_CAVEAT = (
-    "If this account is an AWS Organizations member, visibility of credits, refunds "
-    "and discounts is controlled by the management account's Cost Explorer "
-    "preferences. If hidden, these figures will not reflect them."
-)
-GOVCLOUD_NOTE = (
-    "GovCloud usage is billed through the associated standard (commercial) account "
-    "and is combined into that account's usage reports. Run from that associated "
-    "account, these figures may include GovCloud spend; it is not separated out here."
-)
-INVOICE_CAVEAT = (
-    "These totals are what AWS reports to this account's Cost Explorer. If this "
-    "account is billed through a reseller, the invoice comes from the reseller and "
-    "may differ from these figures; this export cannot see that invoice."
-)
-API_COST_NOTE = (
-    "AWS bills each paginated Cost Explorer API request. This export makes two "
-    "GetCostAndUsage queries (grouped by SERVICE and by RECORD_TYPE), each one or "
-    "more paginated requests."
-)
-
 # Savings Plans breakdown (second GetCostAndUsage query, grouped by
 # RECORD_TYPE). RECORD_TYPE is a documented GroupBy DIMENSION key for
 # GetCostAndUsage (API reference, GetCostAndUsage > GroupBy). The four API
@@ -597,23 +560,18 @@ def write_govcloud_skip_marker(account_name, account_id):
     ])
 
 
-def create_excel_report(billing_data, account_name, date_suffix,
-                        account_id=None, start_date=None, end_date=None,
-                        sp_result=None):
+def create_excel_report(billing_data, account_name, date_suffix, sp_result=None):
     """
     Create an Excel report with monthly billing data.
 
-    Sheet order: 'Summary' (first, contract unchanged), 'About' (provenance:
-    metric, period, scope caveats), 'Savings Plans' (record-type breakdown or
-    an explicit no-records / lookup-failed state), then one sheet per month.
+    Sheet order: 'Summary' (first, contract unchanged), 'Savings Plans'
+    (record-type breakdown or an explicit no-records / lookup-failed state),
+    then one sheet per month.
 
     Args:
         billing_data (dict): Billing data organized by month and service
         account_name (str): Name of AWS account for file naming
         date_suffix (str): Date suffix for filename
-        account_id (str): AWS account ID, shown on the About sheet
-        start_date (datetime): Period start (inclusive)
-        end_date (datetime): Period end (exclusive, Cost Explorer contract)
         sp_result (dict): summarize_savings_plans() or savings_plans_failure()
             output. None is rendered as a failed (not queried) lookup, never
             as 'no records'.
@@ -642,10 +600,7 @@ def create_excel_report(billing_data, account_name, date_suffix,
 
     # Create a summary sheet
     summary_sheet = wb.create_sheet("Summary")
-    # Created now so it sits directly after Summary. Month sheets are named
-    # '%b %Y' (e.g. 'Aug 2026'), which always contains a space and a year, so
-    # they cannot collide with 'About'.
-    about_sheet = wb.create_sheet(ABOUT_SHEET)
+    # Created now so it sits directly after Summary.
     sp_sheet = wb.create_sheet(SP_SHEET)
     write_savings_plans_sheet(sp_sheet, sp_result, header_font, header_fill)
     summary_sheet['A1'] = 'Month'
@@ -718,34 +673,6 @@ def create_excel_report(billing_data, account_name, date_suffix,
         summary_sheet[f'B{summary_row}'].number_format = '$#,##0.00'
         summary_row += 1
         total_all_months += total_cost
-
-    # Provenance sheet
-    about_rows = [
-        ('Account ID', account_id or 'UNKNOWN'),
-        ('Account Name', account_name),
-        ('Cost Metric', COST_METRIC),
-        ('Metric Meaning', METRIC_MEANING),
-        ('Period Start (inclusive)', start_date.strftime('%Y-%m-%d') if start_date else 'N/A'),
-        ('Period End (inclusive)',
-         (end_date - datetime.timedelta(days=1)).strftime('%Y-%m-%d') if end_date else 'N/A'),
-        ('Generated', datetime.datetime.now().strftime('%m.%d.%Y %H:%M:%S')),
-        ('Tool Version', utils.get_version()),
-        ('Data Scope', DATA_SCOPE),
-        ('Org Caveat', ORG_CAVEAT),
-        ('GovCloud Note', GOVCLOUD_NOTE),
-        ('Invoice Caveat', INVOICE_CAVEAT),
-        ('API Cost Note', API_COST_NOTE),
-    ]
-    about_sheet['A1'] = 'Field'
-    about_sheet['B1'] = 'Value'
-    for cell in (about_sheet['A1'], about_sheet['B1']):
-        cell.font = header_font
-        cell.fill = header_fill
-    for idx, (field, value) in enumerate(about_rows, start=2):
-        about_sheet[f'A{idx}'] = field
-        about_sheet[f'B{idx}'] = value
-    about_sheet.column_dimensions['A'].width = max(len(f) for f, _ in about_rows) + 2
-    about_sheet.column_dimensions['B'].width = 100
 
     # Add total row to summary
     summary_sheet[f'A{summary_row}'] = 'Total All Months'
@@ -896,9 +823,7 @@ def main():
 
         # Create Excel report
         output_file = create_excel_report(
-            billing_data, account_name, date_suffix,
-            account_id=account_id, start_date=start_date, end_date=end_date,
-            sp_result=sp_result,
+            billing_data, account_name, date_suffix, sp_result=sp_result,
         )
 
         print("\nBilling data export completed successfully.")
