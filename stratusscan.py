@@ -941,13 +941,13 @@ def run_org_scan() -> None:
             )
             exit_code = result.returncode
         except subprocess.CalledProcessError as exc:
-            utils.log_error("Org scan: account %s exporter failed: %s", acct_id, exc)
+            utils.log_error(f"Org scan: account {acct_id} exporter failed", exc)
             exit_code = exc.returncode if exc.returncode is not None else 1
         except subprocess.TimeoutExpired:
-            utils.log_error("Org scan: account %s exporter timed out (30 min)", acct_id)
+            utils.log_error(f"Org scan: account {acct_id} exporter timed out (30 min)")
             exit_code = -1
         except Exception as exc:  # noqa: BLE001
-            utils.log_error("Org scan: account %s unexpected error: %s", acct_id, exc)
+            utils.log_error(f"Org scan: account {acct_id} unexpected error", exc)
             exit_code = -1
 
         duration_s = time.monotonic() - start_time
@@ -1085,10 +1085,10 @@ def _resume_org_scan_from_session(session: dict) -> None:
             proc = subprocess.run([sys.executable, str(script_file)], env=child_env, timeout=1800)
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
-            utils.log_error("Resume org-scan: %s timed out", acct_id)
+            utils.log_error(f"Resume org-scan: {acct_id} timed out")
             exit_code = -1
         except Exception as exc:  # noqa: BLE001
-            utils.log_error("Resume org-scan: %s error: %s", acct_id, exc)
+            utils.log_error(f"Resume org-scan: {acct_id} error", exc)
             exit_code = -1
         duration_s = time.monotonic() - start_t
         status_str = "success" if exit_code == 0 else "failed"
