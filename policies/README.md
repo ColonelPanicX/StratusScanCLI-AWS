@@ -34,7 +34,7 @@ If you need custom policies (e.g., for additional restrictions), use the JSON fi
 - **`commercial-optional-permissions.json`** - Optional permissions for advanced features
   - 4 statement blocks
   - 38 total actions
-  - Services: ML/AI (SageMaker, Bedrock, Comprehend, Rekognition), Global Edge (CloudFront, Global Accelerator), Mobile/Marketing (Pinpoint), Marketplace
+  - Services: ML/AI (SageMaker, Bedrock, Comprehend, Rekognition), Global Edge (CloudFront, Global Accelerator), Mobile/Marketing (Pinpoint), Marketplace, Cost Explorer utilization (Savings Plans / RI utilization and coverage -- paid, opt-in)
 
 ### AWS GovCloud (Partition: `aws-us-gov`)
 

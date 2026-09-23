@@ -43,6 +43,14 @@ def fake_aws_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def pin_cost_explorer_off(monkeypatch):
+    """Keep the paid Cost Explorer queries off and partition detection local
+    (no STS call) -- they are covered in test_savings_plans_cost_explorer.py."""
+    monkeypatch.setenv("STRATUSSCAN_CE_UTILIZATION", "0")
+    monkeypatch.setattr(savings_plans_export.utils, "detect_partition", lambda *a, **kw: "aws")
+
+
+@pytest.fixture(autouse=True)
 def patch_output_dir(tmp_path, monkeypatch):
     """Redirect get_output_dir() to a temp directory for every test."""
     monkeypatch.setattr(savings_plans_export.utils, "get_output_dir", lambda: tmp_path)

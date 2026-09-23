@@ -8,24 +8,34 @@ Title: AWS Savings Plans Export Tool
 Date: NOV-09-2025
 
 Description:
-This script exports AWS Savings Plans information into an Excel file with multiple
-worksheets. The output includes active and queued savings plans with commitment details,
-savings estimates, and usage tracking.
+Exports AWS Savings Plans inventory and, when enabled, Cost Explorer
+utilization into an Excel workbook.
 
-Features:
-- Active savings plans with commitment details and expiration
-- Queued (pending) savings plans
-- Savings plan types: Compute, EC2, SageMaker
-- Payment options and term lengths
-- Hourly commitment amounts and currencies
-- Savings estimates and utilization tracking
+Always collected (savingsplans:DescribeSavingsPlans):
+- Active and queued Savings Plans: type, state, payment option, term,
+  hourly commitment, currency, upfront/recurring payment, start/end, tags
+- Summary: plan counts and hourly commitment totals by plan type
+
+Collected only when Cost Explorer queries are enabled (paid API, opt-in):
+- Monthly utilization for all Savings Plans (ce:GetSavingsPlansUtilization):
+  utilization %, total/used/unused commitment, net savings, on-demand cost
+  equivalent, amortized commitment -- last N complete months
+- Per-plan monthly utilization (ce:GetSavingsPlansUtilizationDetails), one
+  query per month because that operation returns no per-month breakdown
+
+Cost Explorer queries are skipped in aws-us-gov (no Cost Explorer there) and
+are off by default because AWS charges $0.01 per paginated request. Enable
+with ``python advanced_settings.py`` -> Configure Cost Explorer Queries, or
+for one run with ``STRATUSSCAN_CE_UTILIZATION=1``. Every Cost Explorer sheet
+states whether data was returned, AWS had none, the query was never made
+(disabled / GovCloud), or the lookup failed.
 """
 
 import datetime
 import sys
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Add path to import utils module
 try:
@@ -214,6 +224,376 @@ def collect_savings_plans(states: list[str]) -> list[dict[str, Any]]:
     return all_plans
 
 
+# ---------------------------------------------------------------------------
+# Cost Explorer utilization (Issue #285)
+# ---------------------------------------------------------------------------
+
+SHEET_CE_MONTHLY = 'SP Utilization (Monthly)'
+SHEET_CE_PER_PLAN = 'SP Utilization (Per Plan)'
+SHEET_CE_STATUS = 'SP Utilization Status'
+
+OP_MONTHLY = 'GetSavingsPlansUtilization'
+OP_PER_PLAN = 'GetSavingsPlansUtilizationDetails'
+
+# DataType values documented for GetSavingsPlansUtilizationDetails. Requested
+# explicitly: the API reference does not state what an omitted DataType returns.
+_DETAIL_DATA_TYPES = ['ATTRIBUTES', 'UTILIZATION', 'AMORTIZED_COMMITMENT', 'SAVINGS']
+
+
+def _ce_number(value: Any) -> Any:
+    """Cost Explorer returns amounts as strings; convert when numeric, else None."""
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sp_metric_columns(block: dict[str, Any]) -> dict[str, Any]:
+    """
+    Flatten the Utilization / Savings / AmortizedCommitment blocks shared by
+    SavingsPlansUtilizationByTime, SavingsPlansUtilizationDetail and
+    SavingsPlansUtilizationAggregates. Values are read as returned; nothing
+    is computed.
+    """
+    util = block.get('Utilization', {}) or {}
+    savings = block.get('Savings', {}) or {}
+    amort = block.get('AmortizedCommitment', {}) or {}
+    return {
+        'Utilization %': _ce_number(util.get('UtilizationPercentage')),
+        'Total Commitment': _ce_number(util.get('TotalCommitment')),
+        'Used Commitment': _ce_number(util.get('UsedCommitment')),
+        'Unused Commitment': _ce_number(util.get('UnusedCommitment')),
+        'Net Savings': _ce_number(savings.get('NetSavings')),
+        'On-Demand Cost Equivalent': _ce_number(savings.get('OnDemandCostEquivalent')),
+        'Amortized Recurring Commitment': _ce_number(amort.get('AmortizedRecurringCommitment')),
+        'Amortized Upfront Commitment': _ce_number(amort.get('AmortizedUpfrontCommitment')),
+        'Total Amortized Commitment': _ce_number(amort.get('TotalAmortizedCommitment')),
+    }
+
+
+def query_sp_utilization_monthly(
+    ce_client, periods: list[tuple[str, str]], counter: dict[str, int]
+) -> list[dict[str, Any]]:
+    """
+    One GetSavingsPlansUtilization call over the whole window, MONTHLY.
+
+    The operation has no pagination token in its request or response (API
+    reference), so a single request returns every month.
+
+    Returns:
+        Rows, one per month plus a period TOTAL row when AWS returned one.
+        Raises on any API error (caller classifies).
+    """
+    counter['requests'] += 1
+    response = ce_client.get_savings_plans_utilization(
+        TimePeriod={'Start': periods[0][0], 'End': periods[-1][1]},
+        Granularity='MONTHLY',
+    )
+    rows: list[dict[str, Any]] = []
+    for entry in response.get('SavingsPlansUtilizationsByTime', []) or []:
+        tp = entry.get('TimePeriod', {}) or {}
+        start = tp.get('Start', '')
+        row = {
+            'Month': start[:7] if start else 'N/A',
+            'Period Start': start or 'N/A',
+            'Period End (exclusive)': tp.get('End', 'N/A'),
+        }
+        row.update(_sp_metric_columns(entry))
+        rows.append(row)
+    total = response.get('Total')
+    if rows and total:
+        row = {
+            'Month': 'TOTAL (period)',
+            'Period Start': periods[0][0],
+            'Period End (exclusive)': periods[-1][1],
+        }
+        row.update(_sp_metric_columns(total))
+        rows.append(row)
+    return rows
+
+
+def _plan_id_from_arn(arn: str) -> str:
+    """Savings Plan ARNs end in 'savingsplan/<id>'; return the id or 'N/A'."""
+    marker = 'savingsplan/'
+    return arn.split(marker, 1)[1] if marker in arn else 'N/A'
+
+
+def query_sp_utilization_per_plan(
+    ce_client,
+    periods: list[tuple[str, str]],
+    inventory: dict[str, dict[str, Any]],
+    counter: dict[str, int],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    GetSavingsPlansUtilizationDetails, one call-chain per month.
+
+    The operation returns one aggregate per plan for the whole TimePeriod and
+    "doesn't support granular or grouped data (daily/monthly)" (API
+    reference), so each month is its own query. Paginated by NextToken; there
+    is no boto3 paginator for it.
+
+    Args:
+        inventory: Savings Plan rows keyed by ARN (from DescribeSavingsPlans)
+            used only to label rows with ID/type/commitment.
+        counter: ``{'requests': n}``, incremented before every request so the
+            count stays right even when a request raises.
+
+    Returns:
+        (rows, months_unavailable). A month that raises
+        DataUnavailableException is recorded and skipped; any other error
+        raises (caller classifies).
+    """
+    rows: list[dict[str, Any]] = []
+    unavailable: list[str] = []
+    for start, end in periods:
+        next_token = None
+        try:
+            while True:
+                params: dict[str, Any] = {
+                    'TimePeriod': {'Start': start, 'End': end},
+                    'DataType': _DETAIL_DATA_TYPES,
+                }
+                if next_token:
+                    params['NextToken'] = next_token
+                counter['requests'] += 1
+                response = ce_client.get_savings_plans_utilization_details(**params)
+                for detail in response.get('SavingsPlansUtilizationDetails', []) or []:
+                    arn = detail.get('SavingsPlanArn', 'N/A') or 'N/A'
+                    inv = inventory.get(arn, {})
+                    attributes = detail.get('Attributes', {}) or {}
+                    row = {
+                        'Month': start[:7],
+                        'Savings Plan ID': inv.get('Savings Plan ID') or _plan_id_from_arn(arn),
+                        'Savings Plan Type': inv.get('Savings Plan Type', 'Not in active/queued inventory'),
+                        'Payment Option': inv.get('Payment Option', 'N/A'),
+                        'Hourly Commitment': inv.get('Hourly Commitment', 'N/A'),
+                    }
+                    row.update(_sp_metric_columns(detail))
+                    row['Attributes'] = (
+                        '; '.join(f"{k}={v}" for k, v in sorted(attributes.items())) or 'None'
+                    )
+                    row['Savings Plan ARN'] = arn
+                    rows.append(row)
+                next_token = response.get('NextToken')
+                if not next_token:
+                    break
+        except Exception as exc:  # noqa: BLE001 - classified below or re-raised
+            _status, _detail, is_failure = utils.classify_cost_explorer_error(exc)
+            if is_failure:
+                raise
+            unavailable.append(start[:7])
+            continue
+    rows.sort(key=lambda r: (r['Month'], r['Savings Plan ARN']))
+    return rows, unavailable
+
+
+def _status_frame_rows(status: str, detail: str) -> list[dict[str, Any]]:
+    """Single-row body for a Cost Explorer sheet that holds no data."""
+    return [{'Status': status, 'Detail': detail}]
+
+
+def collect_sp_cost_explorer(
+    partition: str,
+    settings: dict[str, Any],
+    inventory: dict[str, dict[str, Any]],
+    today: Optional[datetime.date] = None,
+) -> dict[str, Any]:
+    """
+    Run (or decline to run) the Savings Plans Cost Explorer queries.
+
+    Never raises. Returns a result describing each query's stated outcome:
+    ``{'monthly': {...}, 'per_plan': {...}, 'requests': int, 'periods': [...],
+    'failed_scopes': [(scope, message), ...], 'settings': settings,
+    'partition': partition}``. Each query dict has ``status``, ``detail`` and
+    ``rows``.
+    """
+    periods = utils.cost_explorer_month_window(settings['lookback_months'], today)
+    result: dict[str, Any] = {
+        'periods': periods,
+        'requests': 0,
+        'failed_scopes': [],
+        'settings': settings,
+        'partition': partition,
+    }
+
+    if not utils.is_service_available_in_partition('ce', partition):
+        detail = (
+            "Cost Explorer does not exist in the aws-us-gov partition. Savings Plans that "
+            "apply to GovCloud usage are purchased in, and reported by, the associated "
+            "standard (commercial) account -- run this export there."
+        )
+        for key in ('monthly', 'per_plan'):
+            result[key] = {'status': utils.CE_STATUS_GOVCLOUD, 'detail': detail, 'rows': []}
+        return result
+
+    if not settings['enabled']:
+        detail = f"Setting source: {settings['source']}. {utils.cost_explorer_enable_hint()}"
+        for key in ('monthly', 'per_plan'):
+            result[key] = {'status': utils.CE_STATUS_DISABLED, 'detail': detail, 'rows': []}
+        return result
+
+    # Cost Explorer's API endpoint is ce.us-east-1.amazonaws.com (Cost
+    # Management user guide, ce-api.html); GovCloud never reaches this line.
+    try:
+        ce_client = utils.get_boto3_client('ce', region_name='us-east-1')
+    except Exception as exc:  # noqa: BLE001 - stated on the sheet, never raised
+        detail = f"Could not create Cost Explorer client: {exc}"
+        for key, scope in (('monthly', 'cost_explorer_sp_utilization'),
+                           ('per_plan', 'cost_explorer_sp_utilization_details')):
+            result[key] = {'status': utils.CE_STATUS_FAILED, 'detail': detail, 'rows': []}
+            result['failed_scopes'].append((scope, detail))
+        return result
+    counter = {'requests': 0}
+
+    # Monthly aggregate.
+    denied = False
+    try:
+        rows = query_sp_utilization_monthly(ce_client, periods, counter)
+        if rows:
+            result['monthly'] = {'status': utils.CE_STATUS_DATA, 'detail': f"{len(rows)} row(s).", 'rows': rows}
+        else:
+            result['monthly'] = {
+                'status': utils.CE_STATUS_NO_DATA,
+                'detail': f"{OP_MONTHLY} returned no utilization periods for this window.",
+                'rows': [],
+            }
+    except Exception as exc:  # noqa: BLE001 - every outcome is stated on the sheet
+        status, detail, is_failure = utils.classify_cost_explorer_error(exc)
+        detail = f"ce:{OP_MONTHLY} -- {detail}"
+        result['monthly'] = {'status': status, 'detail': detail, 'rows': []}
+        if is_failure:
+            result['failed_scopes'].append(('cost_explorer_sp_utilization', detail))
+            denied = utils.is_cost_explorer_access_denied(exc)
+
+    # Per-plan, one query per month. After a denial, skip it: every month
+    # would be another denied request.
+    if denied:
+        detail = (
+            f"Not attempted: ce:{OP_MONTHLY} was denied, so ce:{OP_PER_PLAN} was skipped. "
+            "Grant both actions."
+        )
+        result['per_plan'] = {'status': utils.CE_STATUS_FAILED, 'detail': detail, 'rows': []}
+        result['failed_scopes'].append(('cost_explorer_sp_utilization_details', detail))
+        result['requests'] = counter['requests']
+        return result
+
+    try:
+        rows, unavailable = query_sp_utilization_per_plan(ce_client, periods, inventory, counter)
+        note = f" Months with DataUnavailableException: {', '.join(unavailable)}." if unavailable else ""
+        if rows:
+            result['per_plan'] = {
+                'status': utils.CE_STATUS_DATA,
+                'detail': f"{len(rows)} plan-month row(s).{note}",
+                'rows': rows,
+            }
+        elif unavailable and len(unavailable) == len(periods):
+            result['per_plan'] = {
+                'status': utils.CE_STATUS_UNAVAILABLE,
+                'detail': f"AWS reported data unavailable for every month queried.{note}",
+                'rows': [],
+            }
+        else:
+            result['per_plan'] = {
+                'status': utils.CE_STATUS_NO_DATA,
+                'detail': f"{OP_PER_PLAN} returned no Savings Plans for any month queried.{note}",
+                'rows': [],
+            }
+    except Exception as exc:  # noqa: BLE001 - every outcome is stated on the sheet
+        _status, detail, _ = utils.classify_cost_explorer_error(exc)
+        detail = f"ce:{OP_PER_PLAN} -- {detail} Partial per-plan rows were discarded."
+        result['per_plan'] = {'status': utils.CE_STATUS_FAILED, 'detail': detail, 'rows': []}
+        result['failed_scopes'].append(('cost_explorer_sp_utilization_details', detail))
+
+    result['requests'] = counter['requests']
+    return result
+
+
+def build_sp_cost_explorer_sheets(ce_result: dict[str, Any]) -> dict[str, Any]:
+    """
+    Turn a collect_sp_cost_explorer() result into DataFrames.
+
+    Every sheet is always present. A query that produced no rows gets a
+    single Status/Detail row naming why -- never a blank sheet.
+    """
+    import pandas as pd
+
+    sheets: dict[str, Any] = {}
+    for key, sheet in (('monthly', SHEET_CE_MONTHLY), ('per_plan', SHEET_CE_PER_PLAN)):
+        q = ce_result[key]
+        if q['status'] == utils.CE_STATUS_DATA and q['rows']:
+            sheets[sheet] = pd.DataFrame(q['rows'])
+        else:
+            sheets[sheet] = pd.DataFrame(_status_frame_rows(q['status'], q['detail']))
+
+    periods = ce_result['periods']
+    settings = ce_result['settings']
+    requests = ce_result['requests']
+    status_rows = [
+        {'Field': 'Cost Explorer queries', 'Value': 'Enabled' if settings['enabled'] else 'Disabled'},
+        {'Field': 'Setting source', 'Value': settings['source']},
+        {'Field': 'How to enable / disable', 'Value': utils.cost_explorer_enable_hint()},
+        {'Field': 'Partition', 'Value': ce_result['partition']},
+        {
+            'Field': 'Period',
+            'Value': (
+                f"{periods[0][0]} to {periods[-1][1]} (end exclusive): the last "
+                f"{len(periods)} complete month(s). The current month is not included."
+            ),
+        },
+        {'Field': f'Monthly utilization (ce:{OP_MONTHLY})', 'Value': ce_result['monthly']['status']},
+        {'Field': 'Monthly utilization detail', 'Value': ce_result['monthly']['detail']},
+        {'Field': f'Per-plan utilization (ce:{OP_PER_PLAN})', 'Value': ce_result['per_plan']['status']},
+        {'Field': 'Per-plan utilization detail', 'Value': ce_result['per_plan']['detail']},
+        {'Field': 'Cost Explorer API requests issued', 'Value': requests},
+        {
+            'Field': 'Cost Explorer API charge',
+            'Value': (
+                f"${utils.CE_REQUEST_COST_USD:.2f} per paginated request "
+                f"({utils.CE_REQUEST_COST_SOURCE}); this run issued {requests} request(s) "
+                f"= ${requests * utils.CE_REQUEST_COST_USD:.2f}. SDK retries after "
+                "throttling are not counted here."
+            ),
+        },
+        {
+            'Field': 'Scope',
+            'Value': (
+                "Utilization is what this account's Cost Explorer reports. A management "
+                "account sees its member accounts; a member account may not see plans "
+                "held elsewhere in the organization."
+            ),
+        },
+        {
+            'Field': 'Amounts',
+            'Value': "As returned by Cost Explorer, unconverted. Nothing on these sheets is computed.",
+        },
+    ]
+    sheets[SHEET_CE_STATUS] = pd.DataFrame(status_rows)
+    return sheets
+
+
+def run_sp_cost_explorer(plan_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Resolve partition and settings, then run collect_sp_cost_explorer().
+
+    Partition detection runs first so a GovCloud run reports "unavailable in
+    aws-us-gov" rather than "disabled" -- enabling it there would not help.
+    """
+    settings = utils.cost_explorer_utilization_settings()
+    partition = utils.detect_partition()
+    inventory = {
+        row.get('Savings Plan ARN'): row for row in plan_rows if row.get('Savings Plan ARN')
+    }
+    if settings['enabled'] and utils.is_service_available_in_partition('ce', partition):
+        months = settings['lookback_months']
+        utils.log_info(
+            f"Querying Cost Explorer for Savings Plans utilization: {months} month(s), "
+            f"about {months + 1} paginated request(s) at ${utils.CE_REQUEST_COST_USD:.2f} each."
+        )
+    return collect_sp_cost_explorer(partition, settings, inventory)
+
+
 def export_savings_plans_data(account_id: str, account_name: str):
     """
     Export Savings Plans information to an Excel file.
@@ -305,6 +685,22 @@ def export_savings_plans_data(account_id: str, account_name: str):
         })
 
         data_frames['Summary'] = pd.DataFrame(summary_data)
+
+    # STEP 3b: Cost Explorer utilization (opt-in, paid, not in GovCloud).
+    # collect_sp_cost_explorer never raises; each query's outcome is a stated
+    # status. A failed lookup the operator opted into is a failed scope.
+    ce_result = run_sp_cost_explorer(active_plans + queued_plans)
+    failed_scopes.extend(ce_result['failed_scopes'])
+    ce_has_data = any(
+        ce_result[key]['status'] == utils.CE_STATUS_DATA for key in ('monthly', 'per_plan')
+    )
+    # CE sheets ride along whenever a workbook is written. With no plans in
+    # inventory, a workbook is still written if Cost Explorer returned data
+    # (e.g. a plan that retired inside the window).
+    if data_frames or ce_has_data:
+        data_frames.update(build_sp_cost_explorer_sheets(ce_result))
+    for key, label in (('monthly', 'Monthly utilization'), ('per_plan', 'Per-plan utilization')):
+        utils.log_info(f"Cost Explorer {label}: {ce_result[key]['status']}")
 
     # Check if we have any data. A genuinely empty result (no data AND no
     # failed scopes) gets a plain warning; a failed scope is handled below

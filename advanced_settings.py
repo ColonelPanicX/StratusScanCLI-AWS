@@ -12,6 +12,7 @@ Features:
 - Concurrent scanning configuration (max workers, fallback behavior)
 - Progress display verbosity levels (quiet, standard, verbose)
 - Session-level caching settings
+- Cost Explorer utilization queries (paid, opt-in)
 - Performance tuning options
 
 Usage:
@@ -69,6 +70,14 @@ def get_default_settings():
             # Hard wall-clock budget. Past this the fetch is abandoned and the
             # bundled snapshot is used.
             'max_seconds': 180,
+        },
+        # Cost Explorer utilization/coverage queries in the Savings Plans and
+        # Reserved Instances exporters. Off by default: AWS charges $0.01 per
+        # paginated Cost Explorer API request. The environment variable
+        # STRATUSSCAN_CE_UTILIZATION=1/0 overrides this for a single run.
+        'cost_explorer': {
+            'utilization_enabled': utils.CE_UTILIZATION_DEFAULT_ENABLED,
+            'lookback_months': utils.CE_UTILIZATION_DEFAULT_LOOKBACK_MONTHS,
         },
         'performance': {
             'batch_dataframe_size': 1000,
@@ -259,6 +268,42 @@ def configure_caching():
     }
 
 
+def configure_cost_explorer():
+    """Configure the opt-in Cost Explorer utilization / coverage queries."""
+    print("\n" + "="*70)
+    print("COST EXPLORER QUERIES")
+    print("="*70)
+    print("\nWhen enabled, the Savings Plans export adds monthly and per-plan")
+    print("utilization, and the Reserved Instances export adds monthly RI")
+    print("utilization and coverage, all from the Cost Explorer API.")
+    print(f"\nCost: AWS charges ${utils.CE_REQUEST_COST_USD:.2f} per paginated Cost Explorer request.")
+    print("  - Savings Plans export: about 1 + (months) requests (13 for 12 months)")
+    print("  - Reserved Instances export: at least 8 requests")
+    print("Not available in GovCloud (aws-us-gov); those runs skip it regardless.")
+    print(f"\nOne-run override without changing this setting: {utils.CE_UTILIZATION_ENV_VAR}=1")
+
+    current = get_current_settings()['cost_explorer']
+    enabled_str = 'Yes' if current['utilization_enabled'] else 'No'
+    enabled = utils.prompt_for_confirmation(
+        f"\nEnable Cost Explorer queries? [Current: {enabled_str}]",
+        default=bool(current['utilization_enabled']),
+    )
+
+    months = current['lookback_months']
+    if enabled:
+        options = [12, 6, 3, 1]
+        choice = utils.prompt_menu(
+            f"MONTHS OF HISTORY (current: {months})",
+            [f"{n} complete month(s)" for n in options],
+        )
+        months = options[choice - 1]
+
+    return {
+        'utilization_enabled': enabled,
+        'lookback_months': months,
+    }
+
+
 def configure_performance():
     """Configure performance tuning options."""
     print("\n" + "="*70)
@@ -403,6 +448,13 @@ def display_current_settings():
     print(f"  Timeout: {pricing['timeout_seconds']}s per socket, "
           f"{pricing['max_seconds']}s total")
 
+    ce = settings['cost_explorer']
+    print("\nCost Explorer Queries (paid, opt-in):")
+    print(f"  Enabled: {ce['utilization_enabled']}")
+    print(f"  Months of History: {ce['lookback_months']}")
+    ce_effective = utils.cost_explorer_utilization_settings()
+    print(f"  Effective This Session: {ce_effective['enabled']} ({ce_effective['source']})")
+
     print("\nPerformance:")
     print(f"  Batch DataFrame Size: {settings['performance']['batch_dataframe_size']}")
     print(f"  API Retry Attempts: {settings['performance']['api_retry_attempts']}")
@@ -421,6 +473,7 @@ def reset_to_defaults():
     print("  - Concurrent Scanning: Enabled (4 workers, fallback on)")
     print("  - Progress Display: Standard level")
     print("  - Caching: Enabled (session-only)")
+    print("  - Cost Explorer Queries: Disabled")
     print("  - Performance: Default tuning values")
 
     confirm = utils.prompt_for_confirmation("\nAre you sure you want to reset?", default=False)
@@ -450,6 +503,7 @@ def main():
                     "Configure Concurrent Scanning",
                     "Configure Progress Display",
                     "Configure Caching",
+                    "Configure Cost Explorer Queries",
                     "Configure Performance Tuning",
                     "Reset to Defaults",
                     "Exit",
@@ -475,11 +529,21 @@ def main():
             save_settings(current)
         elif choice == 5:
             current = get_current_settings()
-            current['performance'] = configure_performance()
+            try:
+                current['cost_explorer'] = configure_cost_explorer()
+            except (utils.BackSignal, utils.ExitToMainSignal):
+                continue  # nothing saved
+            except utils.QuitSignal:
+                print("\nExiting advanced settings. Cost Explorer setting not changed.")
+                break
             save_settings(current)
         elif choice == 6:
-            reset_to_defaults()
+            current = get_current_settings()
+            current['performance'] = configure_performance()
+            save_settings(current)
         elif choice == 7:
+            reset_to_defaults()
+        elif choice == 8:
             print("\nExiting advanced settings. Changes have been saved.")
             break
 

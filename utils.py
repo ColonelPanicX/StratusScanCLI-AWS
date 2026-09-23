@@ -4606,6 +4606,154 @@ def _pricing_settings() -> dict[str, Any]:
     return defaults
 
 
+# ---------------------------------------------------------------------------
+# Cost Explorer utilization / coverage queries (Issue #285)
+# ---------------------------------------------------------------------------
+
+# Cost Explorer bills every paginated API request ($0.01 each -- AWS Cost
+# Management user guide, bcm-lite-cost-explorer.html "Considerations"), so the
+# Savings Plans / Reserved Instances utilization queries are opt-in.
+CE_UTILIZATION_ENV_VAR = "STRATUSSCAN_CE_UTILIZATION"
+CE_UTILIZATION_DEFAULT_ENABLED = False
+CE_UTILIZATION_DEFAULT_LOOKBACK_MONTHS = 12
+# GetSavingsPlansUtilization/-Details/-Coverage: "The Start date must be within
+# 13 months" (Cost Explorer API reference). The window ends on the 1st of the
+# current month, so 12 complete months is the most that always satisfies it.
+CE_UTILIZATION_MAX_LOOKBACK_MONTHS = 12
+CE_REQUEST_COST_USD = 0.01
+CE_REQUEST_COST_SOURCE = (
+    "https://docs.aws.amazon.com/cost-management/latest/userguide/bcm-lite-cost-explorer.html"
+)
+
+
+def cost_explorer_utilization_settings() -> dict[str, Any]:
+    """
+    Resolve whether the paid Cost Explorer utilization queries may run.
+
+    Reads ``advanced_settings.cost_explorer`` from config.json, then applies
+    the ``STRATUSSCAN_CE_UTILIZATION`` environment override (env wins, as with
+    the pricing feed override). Never raises: a malformed setting falls back to
+    the default (disabled), because the default is the no-charge choice.
+
+    Returns:
+        dict with ``enabled`` (bool), ``lookback_months`` (int, 1..12) and
+        ``source`` (str: where ``enabled`` came from).
+    """
+    enabled = CE_UTILIZATION_DEFAULT_ENABLED
+    months = CE_UTILIZATION_DEFAULT_LOOKBACK_MONTHS
+    source = "default (disabled)"
+    try:
+        configured = config_value("cost_explorer", {}, section="advanced_settings") or {}
+        if isinstance(configured, dict):
+            if isinstance(configured.get("utilization_enabled"), bool):
+                enabled = configured["utilization_enabled"]
+                source = "config.json (advanced_settings.cost_explorer.utilization_enabled)"
+            raw_months = configured.get("lookback_months")
+            if raw_months is not None:
+                try:
+                    candidate = int(raw_months)
+                    if 1 <= candidate <= CE_UTILIZATION_MAX_LOOKBACK_MONTHS:
+                        months = candidate
+                except (TypeError, ValueError):
+                    pass
+    except Exception as exc:  # noqa: BLE001 - settings must never block an export
+        logging.getLogger(__name__).warning(
+            "Could not read cost_explorer advanced settings (%s) - using defaults", exc
+        )
+
+    override = os.environ.get(CE_UTILIZATION_ENV_VAR)
+    if override is not None and override.strip() != "":
+        enabled = override.strip().lower() in ("1", "true", "yes", "on")
+        source = f"environment variable {CE_UTILIZATION_ENV_VAR}={override.strip()}"
+
+    return {"enabled": enabled, "lookback_months": months, "source": source}
+
+
+# Distinct, stated outcomes for a Cost Explorer query. "AWS returned nothing",
+# "we never asked" and "the lookup failed" are different facts and must never
+# collapse into a blank sheet.
+CE_STATUS_DATA = "DATA RETURNED"
+CE_STATUS_NO_DATA = "NO DATA (AWS returned no records)"
+CE_STATUS_UNAVAILABLE = "NO DATA (AWS: DataUnavailableException)"
+CE_STATUS_DISABLED = "NOT QUERIED (Cost Explorer queries disabled)"
+CE_STATUS_GOVCLOUD = "NOT QUERIED (Cost Explorer unavailable in aws-us-gov)"
+CE_STATUS_FAILED = "LOOKUP FAILED"
+
+# Error codes that mean "this identity may not call Cost Explorer".
+_CE_ACCESS_DENIED_CODES = ("AccessDeniedException", "AccessDenied", "UnauthorizedOperation")
+
+
+def is_cost_explorer_access_denied(exc: BaseException) -> bool:
+    """True when ``exc`` is an AWS error meaning the identity may not call this action."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return str((response.get("Error", {}) or {}).get("Code", "")) in _CE_ACCESS_DENIED_CODES
+
+
+def classify_cost_explorer_error(exc: BaseException) -> tuple[str, str, bool]:
+    """
+    Map a Cost Explorer exception to ``(status, detail, is_failure)``.
+
+    ``DataUnavailableException`` is a documented Cost Explorer error ("The
+    requested data is unavailable") and is reported as its own no-data state,
+    not a failure. Everything else is a failed lookup.
+    """
+    code = ""
+    message = str(exc)
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        err = response.get("Error", {}) or {}
+        code = str(err.get("Code", "") or "")
+        message = str(err.get("Message", "") or message)
+    if code == "DataUnavailableException":
+        return CE_STATUS_UNAVAILABLE, f"AWS: {message}", False
+    if code in _CE_ACCESS_DENIED_CODES:
+        return (
+            CE_STATUS_FAILED,
+            f"{code}: {message}. The identity lacks this Cost Explorer read "
+            "action (see policies/); grant it or disable the Cost Explorer queries.",
+            True,
+        )
+    label = code or type(exc).__name__
+    return CE_STATUS_FAILED, f"{label}: {message}", True
+
+
+def cost_explorer_enable_hint() -> str:
+    """One-line instruction for turning the Cost Explorer queries on."""
+    return (
+        "Enable with 'python advanced_settings.py' -> Configure Cost Explorer "
+        "Queries (setting advanced_settings.cost_explorer.utilization_enabled), "
+        f"or for one run: {CE_UTILIZATION_ENV_VAR}=1 python <script>. "
+        f"Cost Explorer charges ${CE_REQUEST_COST_USD:.2f} per paginated API request."
+    )
+
+
+def cost_explorer_month_window(
+    lookback_months: int, today: Optional[datetime.date] = None
+) -> list[tuple[str, str]]:
+    """
+    Return ``[(start, end), ...]`` for the last ``lookback_months`` complete months.
+
+    ``end`` is the 1st of the following month: Cost Explorer's ``TimePeriod.End``
+    is exclusive (API reference, GetReservationUtilization / DateInterval).
+    The current, partial month is excluded. Oldest month first.
+    """
+    today = today or datetime.date.today()
+    months = max(1, min(int(lookback_months), CE_UTILIZATION_MAX_LOOKBACK_MONTHS))
+    year, month = today.year, today.month
+    periods: list[tuple[str, str]] = []
+    for _ in range(months):
+        end = datetime.date(year, month, 1)
+        month -= 1
+        if month == 0:
+            month, year = 12, year - 1
+        start = datetime.date(year, month, 1)
+        periods.append((start.isoformat(), end.isoformat()))
+    periods.reverse()
+    return periods
+
+
 def get_pricing_data(offer_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Return ``(records, provenance)`` for one AWS offer code.

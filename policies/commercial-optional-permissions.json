@@ -66,6 +66,17 @@
         "aws-marketplace:ViewSubscriptions"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "StratusScanOptionalCostExplorerUtilizationPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetSavingsPlansUtilization",
+        "ce:GetSavingsPlansUtilizationDetails",
+        "ce:GetReservationUtilization",
+        "ce:GetReservationCoverage"
+      ],
+      "Resource": "*"
     }
   ]
 }
