@@ -46,51 +46,13 @@ PAGINATORS_REQUIRING_NEWER_BOTO3 = {
 }
 
 # (service, op) pairs that name an operation which does not exist in any SDK
-# version — genuinely broken, tracked separately (issue #212).
-KNOWN_BROKEN_PAGINATORS = {
-    ("acm-pca", "list_certificates"),  # no such ACM PCA API
-}
+# version. Empty since #212 was fixed; keep it that way.
+KNOWN_BROKEN_PAGINATORS: set[tuple[str, str]] = set()
 
 # Baseline of get_paginator() calls on operations that EXIST but are NOT
-# paginatable (issue #214). The ratchet test blocks any NEW such call; entries
-# here should be removed as #214 is burned down. Keyed "<file>::<svc>.<op>".
-KNOWN_NONPAGINATABLE = {
-    "apprunner_export.py::apprunner.list_auto_scaling_configurations",
-    "apprunner_export.py::apprunner.list_services",
-    "apprunner_export.py::apprunner.list_vpc_connectors",
-    "bedrock_export.py::bedrock.list_foundation_models",
-    "cloudtrail_export.py::cloudtrail.list_event_data_stores",
-    "compute_optimizer_export.py::compute-optimizer.get_auto_scaling_group_recommendations",
-    "compute_optimizer_export.py::compute-optimizer.get_ebs_volume_recommendations",
-    "compute_optimizer_export.py::compute-optimizer.get_ec2_instance_recommendations",
-    "compute_optimizer_export.py::compute-optimizer.get_ecs_service_recommendations",
-    "detective_export.py::detective.list_members",
-    "elasticbeanstalk_export.py::elasticbeanstalk.describe_applications",
-    "eventbridge_export.py::events.list_event_buses",
-    "glue_athena_export.py::athena.list_work_groups",
-    "image_builder_export.py::imagebuilder.list_components",
-    "image_builder_export.py::imagebuilder.list_image_pipelines",
-    "image_builder_export.py::imagebuilder.list_image_recipes",
-    "image_builder_export.py::imagebuilder.list_infrastructure_configurations",
-    "lakeformation_export.py::lakeformation.list_permissions",
-    "lakeformation_export.py::lakeformation.list_resources",
-    "license_manager_export.py::license-manager.list_distributed_grants",
-    "license_manager_export.py::license-manager.list_licenses",
-    "license_manager_export.py::license-manager.list_received_grants",
-    "marketplace_export.py::marketplace-agreement.get_agreement_terms",
-    "marketplace_export.py::marketplace-agreement.search_agreements",
-    "savings_plans_export.py::savingsplans.describe_savings_plans",
-    "ses_export.py::sesv2.list_configuration_sets",
-    "ses_export.py::sesv2.list_email_identities",
-    "ses_export.py::sesv2.list_email_templates",
-    "ses_pinpoint_export.py::sesv2.list_configuration_sets",
-    "ses_pinpoint_export.py::sesv2.list_email_identities",
-    "ses_pinpoint_export.py::sesv2.list_email_templates",
-    "shield_export.py::shield.list_protection_groups",
-    "waf_export.py::wafv2.list_ip_sets",
-    "waf_export.py::wafv2.list_rule_groups",
-    "waf_export.py::wafv2.list_web_acls",
-}
+# paginatable (issue #214). Burned down to zero; the ratchet test now blocks
+# any such call. Keyed "<file>::<svc>.<op>".
+KNOWN_NONPAGINATABLE: set[str] = set()
 
 _ops_cache: dict = {}
 _paginatable_cache: dict = {}
