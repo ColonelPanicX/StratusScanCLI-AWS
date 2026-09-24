@@ -1,7 +1,5 @@
 """
-Unit tests for config functions (folded into utils — Issue #177).
-
-Previously tested sslib.config; now tests utils directly.
+Unit tests for config functions (utils.py).
 """
 
 import json
@@ -9,7 +7,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import utils as cfg_mod
 from utils import (
     config_value,

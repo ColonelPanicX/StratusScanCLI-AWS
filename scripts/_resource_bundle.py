@@ -12,7 +12,7 @@ one place instead of N copy-pasted files.
 
 This module is the CLI layer (it is invoked only by bundle scripts that are
 themselves launched as subprocesses), so print() is intentional and allowed —
-the no-print rule in Issue #171 governs utils.py / sslib/ only.
+the no-print rule in Issue #171 governs utils.py only.
 """
 
 import os

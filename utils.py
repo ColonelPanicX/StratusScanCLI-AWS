@@ -2872,7 +2872,6 @@ def validate_export(
 
 # =============================================================================
 # CONFIG — Configuration singleton and account-mapping utilities
-# (folded in from sslib/config.py — Issue #177)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -3311,7 +3310,6 @@ def remove_cross_account_role(account_id: str) -> bool:
 
 # =============================================================================
 # CONCURRENCY — Concurrent region scanning and pagination utilities
-# (folded in from sslib/concurrency.py — Issue #177)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -3704,7 +3702,6 @@ def build_dataframe_in_batches(
 
 # =============================================================================
 # AWS_CLIENT — FIPS-aware boto3 client factory and partition/region utilities
-# (folded in from sslib/aws_client.py — Issue #177)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -4511,7 +4508,6 @@ def get_cached_account_info() -> tuple[str, str, str]:
 
 # =============================================================================
 # COST — Cost estimation utilities
-# (folded in from sslib/cost.py — Issue #177)
 # =============================================================================
 
 if TYPE_CHECKING:

@@ -1,7 +1,5 @@
 """
-Unit tests for concurrency functions (folded into utils — Issue #177).
-
-Previously tested sslib.concurrency; now tests utils directly.
+Unit tests for concurrency functions (utils.py).
 """
 
 import sys
@@ -11,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import utils
 from utils import (
     ConcurrentScanningError,

@@ -422,7 +422,7 @@ StratusScanCLI-AWS is in active beta development. The API and output format may 
 - **Export format choice**: xlsx (default) or universal CSV (#174).
 - **GovCloud FIPS fix**: `use_fips_endpoint` set on the client `Config`, not passed as a `client()` kwarg.
 - **Scan sessions**: progress tracking and resume for org-scan and smart-scan (#189).
-- **Internals**: `sslib/` folded back into `utils.py` (#177); moto smoke suite covering 101 exporter scripts.
+- **Internals**: shared helpers consolidated into a single `utils.py` (#177); moto smoke suite covering 101 exporter scripts.
 
 ### Previously in v0.4.0
 

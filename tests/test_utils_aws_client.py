@@ -1,14 +1,12 @@
 """
-Unit tests for aws_client functions (folded into utils — Issue #177).
-
-Previously tested sslib.aws_client; now tests utils directly.
+Unit tests for aws_client functions (utils.py).
 """
 
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import utils as aws_mod
 from utils import (
     _DEFAULT_REGIONS,
