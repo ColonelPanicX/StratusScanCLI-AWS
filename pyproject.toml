@@ -42,7 +42,7 @@ classifiers = [
 
 # Runtime dependencies
 dependencies = [
-    "boto3>=1.28.0",           # AWS SDK for Python
+    "boto3>=1.35.65",          # AWS SDK for Python — floor measured in #213; keep = utils.BOTO3_MIN_VERSION
     "pandas>=2.0.0",           # Data manipulation and analysis
     "openpyxl>=3.1.0",         # Excel file creation
     "python-dateutil>=2.8.2",  # Date/time utilities

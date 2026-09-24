@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, UnknownServiceError
 
 try:
     import utils
@@ -301,6 +301,35 @@ def extract_service_from_control_identifier(control_id: str) -> str:
         return 'Other'
 
 
+# Stated value for catalog-sourced columns when the installed SDK predates the
+# Control Catalog API (Issue #213) -- never a blank that reads as "no data".
+CATALOG_UNAVAILABLE = f'Unavailable (boto3 below {utils.BOTO3_MIN_VERSION})'
+
+
+def _make_catalog_client(region: str) -> Any:
+    """
+    Control Catalog client, or None when the installed SDK cannot call GetControl.
+
+    Measured against botocore releases (Issue #213): the ``controlcatalog``
+    service first ships in 1.34.80 and ``GetControl`` in 1.34.152, both below
+    the declared floor. The guard only matters when someone runs below the
+    floor after declining the upgrade: the export degrades to identifier-only
+    metadata instead of losing every control.
+    """
+    try:
+        client = utils.get_boto3_client('controlcatalog', region_name=region)
+    except UnknownServiceError:
+        client = None
+    if client is None or not hasattr(client, 'get_control'):
+        utils.log_warning(
+            "Control Catalog API not in this boto3/botocore; control name, "
+            f"description and behavior will read '{CATALOG_UNAVAILABLE}'. "
+            f"Upgrade with: {utils.sdk_upgrade_command_str()}"
+        )
+        return None
+    return client
+
+
 def _build_control_row(
     control: dict[str, Any],
     ou_name: str,
@@ -323,7 +352,8 @@ def _build_control_row(
         ou_name: Name of the OU this control belongs to.
         ou_arn: ARN of the OU this control belongs to.
         ct_client: The boto3 Control Tower client.
-        catalog_client: The boto3 Control Catalog client.
+        catalog_client: The boto3 Control Catalog client, or None when the
+            installed SDK predates it (see _make_catalog_client).
 
     Returns:
         dict: The assembled control row.
@@ -376,38 +406,43 @@ def _build_control_row(
         utils.log_warning(f"Could not get enabled control details for {control_id}: {str(e)}")
 
     # Try to get control metadata from control catalog
-    try:
-        # Use controlcatalog client to get full metadata
-        catalog_response = catalog_client.get_control(ControlArn=control_id)
-
-        # Extract metadata from control catalog response
-        control_name = catalog_response.get('Name', control_id)
-        control_description = catalog_response.get('Description', 'N/A')
-        control_behavior = catalog_response.get('Behavior', 'N/A')
-
-        # Control catalog doesn't have "Guidance" field - this is Control Tower specific
-        # We'll need to infer it or mark as N/A
-        control_guidance = 'N/A'
-
-        # Extract service from aliases if available
-        aliases = catalog_response.get('Aliases', [])
-        if aliases:
-            # Aliases often have format like "CT.S3.PR.1" or "SH.S3.1"
-            for alias in aliases:
-                if '.' in alias:
-                    parts = alias.split('.')
-                    if len(parts) >= 2:
-                        service_name = parts[1]  # e.g., "S3" from "CT.S3.PR.1"
-                        break
-
-        # If service not found from alias, try extracting from control identifier
-        if service_name == 'N/A':
-            service_name = extract_service_from_control_identifier(control_id)
-
-    except Exception as e:
-        # Fallback: try extracting service from identifier even if catalog call fails
+    if catalog_client is None:
+        control_description = CATALOG_UNAVAILABLE
+        control_behavior = CATALOG_UNAVAILABLE
         service_name = extract_service_from_control_identifier(control_id)
-        utils.log_warning(f"Could not get catalog details for control {control_id}: {str(e)}")
+    else:
+        try:
+            # Use controlcatalog client to get full metadata
+            catalog_response = catalog_client.get_control(ControlArn=control_id)
+
+            # Extract metadata from control catalog response
+            control_name = catalog_response.get('Name', control_id)
+            control_description = catalog_response.get('Description', 'N/A')
+            control_behavior = catalog_response.get('Behavior', 'N/A')
+
+            # Control catalog doesn't have "Guidance" field - this is Control Tower specific
+            # We'll need to infer it or mark as N/A
+            control_guidance = 'N/A'
+
+            # Extract service from aliases if available
+            aliases = catalog_response.get('Aliases', [])
+            if aliases:
+                # Aliases often have format like "CT.S3.PR.1" or "SH.S3.1"
+                for alias in aliases:
+                    if '.' in alias:
+                        parts = alias.split('.')
+                        if len(parts) >= 2:
+                            service_name = parts[1]  # e.g., "S3" from "CT.S3.PR.1"
+                            break
+
+            # If service not found from alias, try extracting from control identifier
+            if service_name == 'N/A':
+                service_name = extract_service_from_control_identifier(control_id)
+
+        except Exception as e:
+            # Fallback: try extracting service from identifier even if catalog call fails
+            service_name = extract_service_from_control_identifier(control_id)
+            utils.log_warning(f"Could not get catalog details for control {control_id}: {str(e)}")
 
     return {
         'OU Name': ou_name,
@@ -461,8 +496,8 @@ def collect_enabled_controls(ous: list[dict[str, Any]]) -> list[dict[str, Any]]:
     home_region = utils.get_partition_default_region()
     ct_client = utils.get_boto3_client('controltower', region_name=home_region)
 
-    # Create controlcatalog client for getting control metadata
-    catalog_client = utils.get_boto3_client('controlcatalog', region_name=home_region)
+    # Control metadata comes from Control Catalog; None when the SDK predates it.
+    catalog_client = _make_catalog_client(home_region)
 
     total_ous = len(ous)
     for idx, ou in enumerate(ous, 1):

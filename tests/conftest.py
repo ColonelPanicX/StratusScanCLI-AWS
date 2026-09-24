@@ -29,3 +29,14 @@ def _offline_pricing(monkeypatch, tmp_path):
     pricing_feed.reset_pricing_cache()
     yield
     pricing_feed.reset_pricing_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_sdk_floor_prompt(monkeypatch):
+    """Never offer the interactive boto3 upgrade (Issue #213) during tests.
+
+    ensure_dependencies() checks the SDK floor; under ``pytest -s`` stdin is a
+    TTY and the offer would block. Marking the floor as already handled keeps
+    it to a log warning. tests/test_sdk_floor.py clears this to test the prompt.
+    """
+    monkeypatch.setenv("STRATUSSCAN_SDK_FLOOR_HANDLED", "1")

@@ -1170,6 +1170,9 @@ def navigate_menus():
         if not check_dependencies():
             print("Required dependencies are missing. Please install them to continue.")
             sys.exit(1)
+        # Children are fresh interpreters, so an upgrade accepted here reaches
+        # every exporter launched afterwards (Issue #213).
+        utils.ensure_sdk_floor(continue_after_upgrade=True)
 
         ensure_directory_structure()
         _startup_interrupted_check()
@@ -1374,6 +1377,9 @@ def _run_full_audit(regions_arg, output) -> None:
     print("\nStratusScanCLI-AWS — full audit run")
     print("=" * 60)
 
+    # Headless: never prompt; a below-floor SDK is logged with the fix (#213).
+    utils.ensure_sdk_floor(allow_prompt=False)
+
     ok, account_id, account_name = utils.validate_aws_credentials()
     if not ok:
         utils.log_error("Full audit: AWS credentials not found or invalid")
@@ -1436,6 +1442,9 @@ def _run_org_audit(regions_arg, output, scan_role, exclude_arg) -> None:
     """
     print("\nStratusScanCLI-AWS — organization audit run")
     print("=" * 60)
+
+    # Headless: never prompt; a below-floor SDK is logged with the fix (#213).
+    utils.ensure_sdk_floor(allow_prompt=False)
 
     ok, account_id, account_name = utils.validate_aws_credentials()
     if not ok:

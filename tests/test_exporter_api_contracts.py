@@ -17,33 +17,46 @@ guard the runtime-fatal mistakes this codebase has actually shipped:
      non-paginatable operation — ratcheted against a baseline so the
      existing backlog can't grow                                    (issue #214)
 
-Version coupling: validity is checked against the *installed* botocore. Real
-services/operations newer than the installed SDK are allowlisted below
-(issue #213) so the test is deterministic.
+Version coupling: validity is checked against the *installed* botocore. At or
+above the declared floor (utils.BOTOCORE_MIN_VERSION, issue #213) the checks
+are strict. Below it (e.g. an OS-packaged botocore on a dev box) a symbol is
+tolerated only if MEASURED_MIN_BOTOCORE records that it first ships in a
+release newer than the installed one -- anything else still fails, so a typo
+like #208's 'verifiedaccess' is caught on every SDK.
 """
 
 import ast
 from pathlib import Path
 
 import boto3
+import botocore
 import botocore.session
 import pytest
 from botocore import xform_name
+
+import utils
 
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 
 _session = botocore.session.get_session()
 _VALID_SERVICES = set(_session.get_available_services())
 
-# Real AWS services newer than the installed botocore floor (issue #213).
-SERVICES_REQUIRING_NEWER_BOTO3 = {
-    "controlcatalog",  # ~boto3 1.34.74 — controltower_export.py
+# First botocore release containing each symbol that sits above older SDKs,
+# measured by installing botocore releases and reading their service models
+# (issue #213) -- not estimated. Keys: service name, or (service, op) for a
+# paginator. Every value must be <= the declared floor (test_sdk_floor.py).
+# Not an allowlist: at/above the floor these entries tolerate nothing.
+MEASURED_MIN_BOTOCORE: dict = {
+    "controlcatalog": "1.34.80",  # controltower_export.py
 }
 
-# (service, op) pairs whose operation is valid only in newer boto3 (issue #213).
-PAGINATORS_REQUIRING_NEWER_BOTO3 = {
-    ("bedrock", "list_guardrails"),  # ~boto3 1.34.140 — bedrock_export.py
-}
+_INSTALLED = utils._version_tuple(botocore.__version__)
+
+
+def _newer_than_installed(symbol) -> bool:
+    """True if this symbol is known to first ship after the installed botocore."""
+    first = MEASURED_MIN_BOTOCORE.get(symbol)
+    return first is not None and utils._version_tuple(first) > _INSTALLED
 
 # (service, op) pairs that name an operation which does not exist in any SDK
 # version. Empty since #212 was fixed; keep it that way.
@@ -145,7 +158,7 @@ def test_get_boto3_client_uses_valid_service(path):
     invalid = [
         (lineno, svc)
         for lineno, svc in _client_service_literals(tree)
-        if svc not in _VALID_SERVICES and svc not in SERVICES_REQUIRING_NEWER_BOTO3
+        if svc not in _VALID_SERVICES and not _newer_than_installed(svc)
     ]
     assert not invalid, (
         f"{path.name} calls get_boto3_client with invalid boto3 service(s): "
@@ -159,7 +172,7 @@ def test_get_paginator_operation_exists(path):
     tree = ast.parse(path.read_text(), str(path))
     bad = []
     for lineno, svc, op in _paginator_calls(tree):
-        if (svc, op) in PAGINATORS_REQUIRING_NEWER_BOTO3 or (svc, op) in KNOWN_BROKEN_PAGINATORS:
+        if _newer_than_installed((svc, op)) or (svc, op) in KNOWN_BROKEN_PAGINATORS:
             continue
         ops = _operations(svc)
         if ops is None:

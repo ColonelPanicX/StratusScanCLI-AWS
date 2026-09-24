@@ -1610,13 +1610,20 @@ if __name__ == "__main__":
                 print(f"  ✅ {package['name']} - {package['description']}")
             for package in dep_status['missing_packages']:
                 print(f"  ❌ {package['name']} - {package['description']}")
+            sdk = utils.check_sdk_floor()
+            sdk_have = f"boto3 {sdk['installed']['boto3']} / botocore {sdk['installed']['botocore']}"
+            if sdk['ok']:
+                print(f"  {utils.GLYPH_OK} AWS SDK {sdk_have} (floor boto3 {sdk['required']['boto3']})")
+            else:
+                print(f"  {utils.GLYPH_FAIL} AWS SDK {sdk_have} is below floor boto3 {sdk['required']['boto3']}")
+                print(f"     Upgrade: {sdk['upgrade_command']}")
             print(f"\nSummary: {dep_status['installed_count']}/{dep_status['total_count']} dependencies satisfied")
             if dep_status['all_satisfied']:
                 print("\n✅ All dependencies are installed.")
             else:
                 missing_names = " ".join(p['name'] for p in dep_status['missing_packages'])
                 print(f"\nInstall missing: pip install {missing_names}")
-            sys.exit(0 if dep_status['all_satisfied'] else 1)
+            sys.exit(0 if dep_status['all_satisfied'] and sdk['ok'] else 1)
 
         elif arg in ['--perms', '--permissions']:
             # Run permissions check only

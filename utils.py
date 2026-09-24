@@ -2242,9 +2242,177 @@ def run_subprocess_with_progress(
     return proc
 
 
+# ---------------------------------------------------------------------------
+# AWS SDK floor (Issue #213)
+# ---------------------------------------------------------------------------
+
+#: Minimum boto3 every exporter needs. MUST equal the ``boto3>=`` pin in
+#: pyproject.toml (tests/test_sdk_floor.py enforces it). Measured, not guessed:
+#: the lowest release whose bundled service models contain every client
+#: service, operation, paginator and request parameter the code uses. The
+#: symbol that sets it is ec2 DescribeVpcBlockPublicAccessOptions (botocore
+#: 1.35.65); runners-up are controlcatalog GetControl (1.34.152), bedrock
+#: ListGuardrails (1.34.90) and the controlcatalog service (1.34.80).
+BOTO3_MIN_VERSION = "1.35.65"
+
+#: boto3 1.35.65's wheel metadata pins ``botocore>=1.35.65,<1.36.0``. Checked
+#: separately because botocore holds the service models, and a stale botocore
+#: can shadow a newer boto3 when user and system site-packages are mixed.
+BOTOCORE_MIN_VERSION = "1.35.65"
+
+#: Set once the floor has been reported/offered in this process tree, so
+#: exporter subprocesses launched from the menu warn instead of re-prompting.
+_SDK_FLOOR_HANDLED_ENV = "STRATUSSCAN_SDK_FLOOR_HANDLED"
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Numeric release tuple for a dotted version ('1.35.65' -> (1, 35, 65)).
+
+    boto3/botocore publish plain X.Y.Z releases; any non-numeric suffix is
+    ignored so a local build tag never crashes the comparison.
+    """
+    match = re.match(r"\d+(?:\.\d+)*", str(version).strip())
+    if not match:
+        return (0,)
+    return tuple(int(part) for part in match.group(0).split("."))
+
+
+def sdk_upgrade_command() -> list[str]:
+    """argv that upgrades boto3 (and with it botocore) to at least the floor.
+
+    ``--user`` outside a virtualenv so the upgrade lands in ``~/.local``: in
+    CloudShell only ``$HOME`` persists between sessions, and the system
+    site-packages are not the user's to modify.
+    """
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if sys.prefix == sys.base_prefix:
+        cmd.append("--user")
+    cmd.append(f"boto3>={BOTO3_MIN_VERSION}")
+    return cmd
+
+
+def sdk_upgrade_command_str() -> str:
+    """Shell-pasteable form of :func:`sdk_upgrade_command`."""
+    return " ".join(
+        f'"{part}"' if ">" in part else part for part in sdk_upgrade_command()
+    )
+
+
+def check_sdk_floor() -> dict[str, Any]:
+    """Compare the *imported* boto3/botocore against the declared floor.
+
+    Reads the running modules' ``__version__`` rather than package metadata:
+    what matters is the SDK this interpreter actually loaded.
+
+    Returns:
+        dict with keys ``ok`` (bool), ``installed`` ({pkg: version}),
+        ``required`` ({pkg: version}), ``below`` (list of
+        ``(pkg, installed, required)`` tuples), ``upgrade_command`` (str).
+    """
+    installed = {"boto3": boto3.__version__, "botocore": botocore.__version__}
+    required = {"boto3": BOTO3_MIN_VERSION, "botocore": BOTOCORE_MIN_VERSION}
+    below = [
+        (pkg, installed[pkg], required[pkg])
+        for pkg in ("boto3", "botocore")
+        if _version_tuple(installed[pkg]) < _version_tuple(required[pkg])
+    ]
+    return {
+        "ok": not below,
+        "installed": installed,
+        "required": required,
+        "below": below,
+        "upgrade_command": sdk_upgrade_command_str(),
+    }
+
+
+def upgrade_sdk() -> dict[str, Any]:
+    """Run pip to bring boto3/botocore up to the floor. Does not print.
+
+    The running interpreter keeps the old modules loaded; only processes
+    started after this call see the upgraded SDK.
+
+    Returns:
+        dict with ``ok`` (bool), ``returncode`` (int or None), ``command`` (str),
+        ``error`` (str, empty on success).
+    """
+    command = sdk_upgrade_command_str()
+    try:
+        completed = subprocess.run(sdk_upgrade_command(), check=False)
+    except OSError as e:
+        return {"ok": False, "returncode": None, "command": command, "error": str(e)}
+    importlib.invalidate_caches()
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "returncode": completed.returncode,
+            "command": command,
+            "error": f"pip exited {completed.returncode}",
+        }
+    return {"ok": True, "returncode": 0, "command": command, "error": ""}
+
+
+def ensure_sdk_floor(*, continue_after_upgrade: bool = False, allow_prompt: bool = True) -> bool:
+    """Warn about, and interactively offer to fix, a boto3/botocore below the floor.
+
+    Below the floor, some exporters fail or degrade (a service or operation
+    the SDK does not know yet). Behavior:
+
+    * at/above the floor: silent, returns True.
+    * auto-run, ``allow_prompt=False`` (headless callers), non-TTY stdin, or
+      already handled earlier in this process tree: logs a warning with the exact upgrade command, returns True.
+    * interactive: asks via :func:`prompt_for_confirmation`. Declined ->
+      warning, returns True. Accepted -> runs pip. On success, returns
+      ``continue_after_upgrade`` (a launcher whose children start fresh can
+      continue; a single exporter has the old SDK loaded and must be re-run).
+      On pip failure logs the manual command and returns True (the run
+      proceeds on the old SDK, as it would have without the offer).
+
+    Returns:
+        bool: True if the caller should proceed.
+    """
+    status = check_sdk_floor()
+    if status["ok"]:
+        return True
+
+    detail = ", ".join(f"{pkg} {have} < {need}" for pkg, have, need in status["below"])
+    command = status["upgrade_command"]
+    log_warning(
+        f"AWS SDK below the StratusScan floor ({detail}). Some exporters will fail "
+        f"or report 'unavailable'. Upgrade with: {command}"
+    )
+
+    already_handled = os.environ.get(_SDK_FLOOR_HANDLED_ENV) == "1"
+    os.environ[_SDK_FLOOR_HANDLED_ENV] = "1"
+    try:
+        interactive = allow_prompt and sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if is_auto_run() or already_handled or not interactive:
+        return True
+
+    if not prompt_for_confirmation(
+        f"Upgrade boto3 to >= {BOTO3_MIN_VERSION} now (pip, user install)?", default=True
+    ):
+        log_warning(f"Continuing on the older SDK. Upgrade later with: {command}")
+        return True
+
+    result = upgrade_sdk()
+    if not result["ok"]:
+        log_error(f"SDK upgrade failed ({result['error']}). Run manually: {command}")
+        return True
+    if continue_after_upgrade:
+        log_success(f"boto3 upgraded to >= {BOTO3_MIN_VERSION}; scripts launched from here will use it.")
+        return True
+    log_success(f"boto3 upgraded to >= {BOTO3_MIN_VERSION}. Re-run this script to use it.")
+    return False
+
+
 def ensure_dependencies(*packages: str) -> bool:
     """
     Check and optionally install required dependencies.
+
+    Also checks boto3/botocore against the declared floor via
+    :func:`ensure_sdk_floor` (Issue #213).
 
     This function checks if the specified packages are installed and offers to
     install any missing packages via pip. It's designed to eliminate duplicate
@@ -2272,6 +2440,9 @@ def ensure_dependencies(*packages: str) -> bool:
         ...     import pandas as pd
         ...     # Continue with script logic
     """
+    if not ensure_sdk_floor():
+        return False
+
     missing = []
 
     # Check each package

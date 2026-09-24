@@ -6,9 +6,8 @@ Focus: the silent-collection-failure contract (Tier-2). See
 .collab/audit/07.16.2026-silent-collection-failure-blast-radius.md
 
 Moto's Bedrock support is limited: ``list_foundation_models`` raises
-``NotImplementedError`` and ``list_guardrails`` is absent from the local
-botocore service model entirely (confirmed via
-``bedrock_client.meta.service_model.operation_names``). Because of this,
+``NotImplementedError`` and ``list_guardrails`` is absent from botocore below
+1.34.90 (Issue #213), so guardrail tests use stub clients. Because of this,
 cases (b)/(c) below (region-API-failure and failed-regions-surfaced) are
 exercised via monkeypatch against ``_scan_foundation_models_region`` rather
 than by driving a real moto failure through ``list_foundation_models``.
@@ -17,7 +16,6 @@ than by driving a real moto failure through ``list_foundation_models``.
 import sys
 from pathlib import Path
 
-import boto3
 import botocore
 import pytest
 from moto import mock_aws
@@ -148,25 +146,48 @@ class TestSilentCollectionFailureRegression:
         assert models == []
         assert [r for r, _ in failed_regions] == [REGION]
 
-    def test_guardrails_op_availability_probe_still_skips_gracefully(self):
+    def test_guardrails_op_availability_probe_skips_when_sdk_lacks_op(self, monkeypatch):
         """
-        The pre-existing #224 op-availability probe must be preserved:
-        when ``list_guardrails`` is absent from the local botocore service
-        model (confirmed true for this environment/moto combination), the
-        region is skipped cleanly with an empty result — NOT recorded as a
-        failed region.
+        Below the SDK floor (Issue #213) the client has no ``list_guardrails``
+        method: the region is skipped cleanly, NOT recorded as failed.
+        Simulated with a stub client so the test does not depend on which
+        botocore happens to be installed.
         """
-        client = boto3.client("bedrock", region_name=REGION)
-        assert "list_guardrails" not in client.meta.service_model.operation_names, (
-            "This test assumes list_guardrails is absent at the botocore floor "
-            "(per Issue #224); if this now fails, botocore has added the "
-            "operation and the op-probe scenario should be revisited."
+
+        class _OldBedrockClient:
+            pass
+
+        monkeypatch.setattr(
+            bedrock_export.utils, "get_boto3_client", lambda *a, **kw: _OldBedrockClient()
         )
 
-        rows = _scan_guardrails_region(REGION)
-        assert rows == []
-
-        # And the scope wrapper must not report this as a failed region.
+        assert _scan_guardrails_region(REGION) == []
         all_guardrails, failed_regions = bedrock_export.collect_guardrails([REGION])
         assert all_guardrails == []
         assert failed_regions == []
+
+    def test_guardrails_collected_when_sdk_has_op(self, monkeypatch):
+        """
+        Regression for the #213 probe bug: the old check tested snake_case
+        ``'list_guardrails'`` against CamelCase ``operation_names`` and skipped
+        guardrails on every SDK. With the op present, rows must come back and
+        pagination must follow ``nextToken``.
+        """
+        pages = [
+            {"guardrails": [{"id": "g1", "name": "one", "arn": "arn:1"}], "nextToken": "t1"},
+            {"guardrails": [{"id": "g2", "name": "two", "arn": "arn:2"}]},
+        ]
+        calls = []
+
+        class _BedrockClient:
+            def list_guardrails(self, **params):
+                calls.append(params)
+                return pages[len(calls) - 1]
+
+        monkeypatch.setattr(
+            bedrock_export.utils, "get_boto3_client", lambda *a, **kw: _BedrockClient()
+        )
+
+        rows = _scan_guardrails_region(REGION)
+        assert [r["Guardrail ID"] for r in rows] == ["g1", "g2"]
+        assert calls == [{"maxResults": 100}, {"maxResults": 100, "nextToken": "t1"}]

@@ -343,11 +343,17 @@ def _scan_guardrails_region(region: str) -> list[dict[str, Any]]:
     utils.log_info(f"Collecting guardrails in {region}...")
     bedrock_client = utils.get_boto3_client('bedrock', region_name=region)
 
-    # list_guardrails is absent in older botocore and unpaginated in newer —
-    # probe for the operation, then page manually via nextToken. A missing
-    # operation is a graceful skip, not a collection failure.
-    if 'list_guardrails' not in bedrock_client.meta.service_model.operation_names:
-        utils.log_info(f"Bedrock guardrails API unavailable in this SDK ({region}); skipping.")
+    # ListGuardrails first ships in botocore 1.34.90, below the declared floor
+    # (Issue #213); the probe only fires when running below the floor. It checks
+    # the client method, not service_model.operation_names -- those are
+    # CamelCase ('ListGuardrails'), so a snake_case membership test was always
+    # False and silently skipped guardrails on every SDK. Pages manually via
+    # nextToken. A missing operation is a graceful skip, not a failed region.
+    if not hasattr(bedrock_client, 'list_guardrails'):
+        utils.log_warning(
+            f"Bedrock guardrails API not in this boto3/botocore ({region}); guardrails "
+            f"not collected. Upgrade with: {utils.sdk_upgrade_command_str()}"
+        )
         return []
 
     region_guardrails = []

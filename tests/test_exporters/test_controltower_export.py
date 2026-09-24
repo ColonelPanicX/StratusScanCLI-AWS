@@ -21,9 +21,8 @@ scripts/lambda_export.py for the finalize shape).
 NOTE on moto: moto has NO Control Tower support at all (no
 ``moto.controltower`` module -- confirmed via
 ``import moto.controltower.models`` raising ``ModuleNotFoundError``), and
-the botocore version pinned by this project (1.34.46) does not even
-recognize ``controlcatalog`` as a valid boto3 service name (confirmed via
-``boto3.client('controlcatalog')`` raising ``UnknownServiceError``). Because
+botocore below 1.34.80 does not recognize ``controlcatalog`` as a service
+(``UnknownServiceError``; measured in Issue #213, below the declared floor). Because
 of this, every test below drives the module through monkeypatched boto3
 clients / module functions rather than real moto-backed Control Tower
 state; ``tests/test_smoke.py::test_exporter_smoke[controltower_export]`` is
@@ -256,6 +255,35 @@ class TestSilentCollectionFailureRegression:
         ids = {row["Control Identifier"] for row in result}
         assert "AWS-GR_GOOD" in ids, "healthy control was lost when a sibling failed"
         assert "AWS-GR_BAD" not in ids, "malformed control should have been skipped"
+
+    def test_controls_survive_sdk_without_controlcatalog(self, monkeypatch):
+        """Issue #213: below the SDK floor, creating the controlcatalog client
+        raises UnknownServiceError. Controls must still be listed, with the
+        catalog columns carrying a stated 'Unavailable' value, not crash."""
+        ct_client = MagicMock()
+        control = {"controlIdentifier": "arn:aws:controltower:us-east-1::control/AWS-GR_S3_X",
+                   "arn": "arn:aws:controltower::123456789012:control/x"}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"enabledControls": [control]}]
+        ct_client.get_paginator.return_value = paginator
+        ct_client.get_enabled_control.return_value = {"enabledControlDetails": {}}
+
+        def fake_get_boto3_client(service, *a, **kw):
+            if service == "controlcatalog":
+                raise botocore.exceptions.UnknownServiceError(
+                    service_name="controlcatalog", known_service_names="controltower"
+                )
+            return ct_client
+
+        monkeypatch.setattr(controltower_export.utils, "get_boto3_client", fake_get_boto3_client)
+        ous = [{"OU ARN": "arn:aws:organizations::123456789012:ou/o-abc/ou-1", "OU Name": "ou-1", "Type": "Organizational Unit"}]
+
+        rows = collect_enabled_controls(ous)
+
+        assert len(rows) == 1
+        assert rows[0]["Control Identifier"] == control["controlIdentifier"]
+        assert rows[0]["Description"] == controltower_export.CATALOG_UNAVAILABLE
+        assert rows[0]["Behavior"] == controltower_export.CATALOG_UNAVAILABLE
 
     # -- (b) Account-scope failure propagation --------------------------------
 
