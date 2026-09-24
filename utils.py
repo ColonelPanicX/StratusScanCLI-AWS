@@ -2470,10 +2470,11 @@ def ensure_dependencies(*packages: str) -> bool:
         )
         return False
 
-    print(f"\nThe following packages are required but not installed: {', '.join(missing)}")
-    response = input("Would you like to install these packages now? (y/n): ").lower().strip()
-
-    if response != 'y':
+    # --yes / -y approves the install (owner decision, 09.24.2026)
+    if not prompt_for_confirmation(
+        f"Required packages are not installed: {', '.join(missing)}. Install them now?",
+        default=False,
+    ):
         log_error(f"Cannot continue without required packages. Run manually: pip install {' '.join(missing)}")
         return False
 
