@@ -182,7 +182,7 @@ def load_rds_pricing_data(region='us-east-1'):
         for instance_type, data in json_data.get('records', {}).items():
             regional = (
                 data.get('pricing', {}).get(pricing_region)
-                or data.get('pricing', {}).get('us-east-1', {})
+                or {}  # no feed row for this partition -> null, never a us-east-1 stand-in
             )
             pricing_data[instance_type] = regional
 
@@ -301,7 +301,7 @@ def calculate_rds_storage_cost(storage_size, storage_type, storage_pricing):
             return 'N/A'
 
         # Get price per GB for the storage type
-        price_per_gb = storage_pricing.get(storage_type, storage_pricing.get('gp3', 0.08))
+        price_per_gb = storage_pricing.get(storage_type)
 
         if price_per_gb is None:
             return 'N/A'

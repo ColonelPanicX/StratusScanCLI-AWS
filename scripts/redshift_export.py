@@ -47,7 +47,7 @@ def load_redshift_pricing_data(region: str = 'us-east-1') -> dict[str, Any]:
         for node_type, info in data.get('records', {}).items():
             regional = (
                 info.get('pricing', {}).get(pricing_region)
-                or info.get('pricing', {}).get('us-east-1', {})
+                or {}  # no feed row for this partition -> null, never a us-east-1 stand-in
             )
             if regional:
                 pricing_data[node_type] = regional

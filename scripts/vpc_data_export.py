@@ -22,6 +22,7 @@ import datetime
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Add path to import utils module
 try:
@@ -524,16 +525,16 @@ def collect_vpc_subnet_data(regions):
     tagged_failures = [(f"{region} (subnets)", err) for region, err in failed_regions]
     return all_subnet_data, tagged_failures
 
-def _load_natgw_monthly_cost() -> float:
-    """Return NAT Gateway base hourly cost × 730 from pricing JSON."""
+def _load_natgw_monthly_cost() -> Optional[float]:
+    """Return NAT Gateway base hourly cost × 730 from pricing JSON; None (renders N/A) when unavailable."""
     pricing_file = Path(__file__).parent.parent / 'reference' / 'natgw-pricing.json'
     try:
         with open(pricing_file, encoding='utf-8') as fh:
             data = json.load(fh)
-        hourly = float(data.get('rates', {}).get('hourly', 0.045))
-        return round(hourly * 730, 2)
+        hourly = data.get('rates', {}).get('hourly')
+        return round(float(hourly) * 730, 2) if hourly is not None else None
     except Exception:
-        return 32.85
+        return None
 
 
 def _build_natgw_row(nat_gw, region, natgw_monthly_cost):
@@ -590,7 +591,7 @@ def _build_natgw_row(nat_gw, region, natgw_monthly_cost):
 
     # Cost: hourly base charge applies to 'available' gateways only
     if state == 'available':
-        monthly_cost = natgw_monthly_cost
+        monthly_cost = natgw_monthly_cost if natgw_monthly_cost is not None else 'N/A'
         cost_note = 'Hourly base only; excludes data processing charges'
     else:
         monthly_cost = 0.0

@@ -242,7 +242,7 @@ def load_pricing_data(region='us-east-1'):
         for instance_type, data in records.items():
             regional = (
                 data.get('pricing', {}).get(pricing_region)
-                or data.get('pricing', {}).get('us-east-1', {})
+                or {}  # no feed row for this partition -> null, never a us-east-1 stand-in
             )
             pricing_data[instance_type] = {
                 'linux': regional.get('linux_on_demand_monthly_usd'),
@@ -409,14 +409,18 @@ def calculate_storage_cost(root_size, root_type, attached_volume_info, storage_p
 
         # Calculate root volume cost
         if root_size != 'N/A' and root_type != 'N/A':
-            root_price = storage_pricing.get(root_type, storage_pricing.get('gp3', 0.08))
+            root_price = storage_pricing.get(root_type)
+            if root_price is None:
+                return 'N/A'
             total_cost += float(root_size) * root_price
 
         # Calculate attached volumes cost
         for _vol_id, vol_info in attached_volume_info.items():
             vol_size = vol_info.get('size', 0)
             vol_type = vol_info.get('type', 'gp3')
-            vol_price = storage_pricing.get(vol_type, storage_pricing.get('gp3', 0.08))
+            vol_price = storage_pricing.get(vol_type)
+            if vol_price is None:
+                return 'N/A'
             total_cost += float(vol_size) * vol_price
 
         return round(total_cost, 2)

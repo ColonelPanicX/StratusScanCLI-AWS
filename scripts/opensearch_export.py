@@ -48,7 +48,7 @@ def load_opensearch_pricing_data(region: str = 'us-east-1') -> dict[str, Any]:
         for instance_type, info in data.get('records', {}).items():
             regional = (
                 info.get('pricing', {}).get(pricing_region)
-                or info.get('pricing', {}).get('us-east-1', {})
+                or {}  # no feed row for this partition -> null, never a us-east-1 stand-in
             )
             if regional:
                 pricing_data[instance_type] = regional
