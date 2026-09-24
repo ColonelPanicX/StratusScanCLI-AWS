@@ -36,10 +36,13 @@
       "Effect": "Allow",
       "Action": [
         "mobiletargeting:GetApp",
+        "mobiletargeting:GetApps",
         "mobiletargeting:GetApplicationSettings",
         "mobiletargeting:GetCampaign",
+        "mobiletargeting:GetCampaigns",
         "mobiletargeting:GetEmailChannel",
         "mobiletargeting:GetSegment",
+        "mobiletargeting:GetSegments",
         "mobiletargeting:GetSmsChannel",
         "mobiletargeting:ListTagsForResource"
       ],

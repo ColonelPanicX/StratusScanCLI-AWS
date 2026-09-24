@@ -11,6 +11,9 @@
         "autoscaling:Describe*",
         "ecs:Describe*",
         "ecs:List*",
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:GetLifecyclePolicy",
         "eks:Describe*",
         "eks:List*",
         "elasticbeanstalk:Describe*",
@@ -90,6 +93,7 @@
       "Effect": "Allow",
       "Action": [
         "ec2:Describe*",
+        "ec2:SearchTransitGatewayRoutes",
         "elasticloadbalancing:Describe*",
         "route53:Get*",
         "route53:List*",
