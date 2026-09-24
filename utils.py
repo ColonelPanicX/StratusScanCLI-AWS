@@ -3058,7 +3058,7 @@ _CONFIG_LOCK: threading.Lock = threading.Lock()
 # STS credential cache — keyed by (role_arn, region), stores (creds_dict, expiry)
 # ---------------------------------------------------------------------------
 
-_STS_CACHE: dict[tuple[str, Optional[str]], tuple[dict[str, str], datetime.datetime]] = {}
+_STS_CACHE: dict[tuple[str, Optional[str], Optional[str]], tuple[dict[str, str], datetime.datetime]] = {}
 _STS_CACHE_LOCK: threading.Lock = threading.Lock()
 _STS_CACHE_REFRESH_MARGIN: datetime.timedelta = datetime.timedelta(minutes=5)
 
@@ -4099,7 +4099,7 @@ def _assume_role_cached(
 ) -> dict[str, str]:
     """
     Assume an IAM role via STS and return temporary credentials, using an
-    in-memory cache keyed by (role_arn, region_name).  Credentials are
+    in-memory cache keyed by (role_arn, region_name, profile).  Credentials are
     refreshed automatically when within 5 minutes of expiry.
 
     Args:
@@ -4115,7 +4115,10 @@ def _assume_role_cached(
         botocore.exceptions.ClientError: On STS API errors (after retries).
     """
     log = logging.getLogger(__name__)
-    cache_key: tuple[str, Optional[str]] = (role_arn, region_name)
+    # Profile is part of the key: the same role assumed from two caller
+    # profiles must not share cached credentials.
+    profile = profile_name or (_SCRIPT_ARGS.profile if _SCRIPT_ARGS else None)
+    cache_key: tuple[str, Optional[str], Optional[str]] = (role_arn, region_name, profile)
 
     # Validate partition alignment before any STS call
     arn_partition = role_arn.split(":")[1] if role_arn.startswith("arn:") else ""
@@ -4146,7 +4149,6 @@ def _assume_role_cached(
         session_name = f"stratusscan-{account_id}"[:64]
 
         # Build caller session (uses profile / env creds, not the assumed role)
-        profile = profile_name or (_SCRIPT_ARGS.profile if _SCRIPT_ARGS else None)
         caller_session = boto3.Session(region_name=region_name, profile_name=profile)
 
         # FIPS for GovCloud STS — must be set on the botocore Config, not as a
@@ -4293,15 +4295,18 @@ def get_boto3_client(
     # FIPS injection — GovCloud requires FIPS endpoints. This belongs on the
     # botocore Config, NOT as a client() kwarg (boto3 rejects it there). A
     # caller may still override via kwargs["use_fips_endpoint"].
+    # With no explicit region, fall back to the session's region (profile/env)
+    # so a GovCloud default region still gets FIPS.
+    session = get_aws_session(region_name, role_arn=role_arn)
+    effective_region = region_name or getattr(session, "region_name", None)
     fips_override = kwargs.pop("use_fips_endpoint", None)
     if fips_override is not None:
         config_kwargs["use_fips_endpoint"] = fips_override
-    elif region_name and region_name.startswith("us-gov-"):
+    elif isinstance(effective_region, str) and effective_region.startswith("us-gov-"):
         config_kwargs["use_fips_endpoint"] = True
 
     config = Config(**config_kwargs)
 
-    session = get_aws_session(region_name, role_arn=role_arn)
     return session.client(service, config=config, **kwargs)
 
 
@@ -4379,6 +4384,12 @@ def is_service_available_in_partition(service: str, partition: str = "aws") -> b
         "connect",
         "rekognition",
         "bedrock",
+        # Not offered in GovCloud per AWS Capabilities by Region (09.2026)
+        "apprunner",
+        "appsync",
+        "cloudfront",
+        # Agreement API endpoint exists only in us-east-1
+        "marketplace-agreement",
     }
 
     govcloud_limited = {

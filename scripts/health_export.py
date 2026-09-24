@@ -149,9 +149,9 @@ def collect_organizational_events(region: str, time_filter: dict[str, Any]) -> l
 
 def _run_export(account_id: str, account_name: str) -> None:
     """Collect AWS Health data and write the Excel export."""
-    # Health API is global but accessed through us-east-1
-    utils.log_info("AWS Health is a global service accessed through us-east-1.")
-    region = 'us-east-1'
+    # Health API endpoint: us-east-1 (Commercial global); GovCloud has a single endpoint in us-gov-west-1
+    region = utils.get_partition_default_region()
+    utils.log_info(f"AWS Health is a global service accessed through {region}.")
 
     # Ask user for time range
     if utils.is_auto_run():

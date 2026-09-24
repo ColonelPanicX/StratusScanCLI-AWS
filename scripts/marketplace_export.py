@@ -312,7 +312,7 @@ def main():
     utils.log_script_start(script_name)
 
     partition = utils.detect_partition()
-    if not utils.is_service_available_in_partition("marketplace", partition):
+    if not utils.is_service_available_in_partition("marketplace-agreement", partition):
         utils.log_warning("AWS Marketplace is not available in AWS GovCloud. Skipping.")
         sys.exit(0)
 

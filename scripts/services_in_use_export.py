@@ -27,7 +27,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import boto3
 from botocore.config import Config as BotocoreConfig
 
 try:
@@ -889,7 +888,7 @@ _DISCOVERY_CLIENT_CONFIG = BotocoreConfig(
 
 def _get_discovery_client(service: str, region: str):
     """Create a boto3 client configured for fast service discovery checks."""
-    session = boto3.Session(region_name=region)
+    session = utils.get_aws_session(region)  # honours STRATUSSCAN_ROLE_ARN / --profile
     config = _DISCOVERY_CLIENT_CONFIG
     # FIPS belongs on the botocore Config, not as a client() kwarg (boto3
     # rejects it there). GovCloud requires FIPS endpoints.

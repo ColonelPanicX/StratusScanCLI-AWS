@@ -138,6 +138,27 @@ class TestGetBoto3ClientFips:
         assert "use_fips_endpoint" not in call_kwargs
         assert call_kwargs["config"].use_fips_endpoint is True
 
+    def test_session_default_govcloud_region_injects_fips(self):
+        """No region_name passed: a GovCloud session default region still gets FIPS."""
+        mock_session = MagicMock()
+        mock_session.region_name = "us-gov-west-1"
+        mock_session.client.return_value = MagicMock()
+
+        with patch("utils.boto3.Session", return_value=mock_session), patch("utils.config_value", return_value={}):
+            get_boto3_client("ec2")
+
+        assert mock_session.client.call_args[1]["config"].use_fips_endpoint is True
+
+    def test_session_default_commercial_region_no_fips(self):
+        mock_session = MagicMock()
+        mock_session.region_name = "us-east-1"
+        mock_session.client.return_value = MagicMock()
+
+        with patch("utils.boto3.Session", return_value=mock_session), patch("utils.config_value", return_value={}):
+            get_boto3_client("ec2")
+
+        assert mock_session.client.call_args[1]["config"].use_fips_endpoint is not True
+
     def test_commercial_does_not_inject_fips(self):
         """Commercial regions must NOT have FIPS forced on."""
         mock_session = MagicMock()

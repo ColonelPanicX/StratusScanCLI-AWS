@@ -25,6 +25,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Add path to import utils module
 try:
@@ -101,7 +102,7 @@ def get_bucket_object_count(bucket_name, region):
     Returns:
         int: Total number of objects (approximate, from last daily metric point)
     """
-    cw_client = utils.get_boto3_client('cloudwatch', region_name='us-east-1')
+    cw_client = utils.get_boto3_client('cloudwatch', region_name=region)  # S3 storage metrics live in the bucket's region
 
     end_time = datetime.datetime.utcnow()
     start_time = end_time - datetime.timedelta(days=3)
@@ -301,15 +302,16 @@ def convert_to_mb(size_in_bytes):
     except (ValueError, TypeError):
         return 0.0
 
-def _load_s3_standard_rate() -> float:
-    """Load S3 Standard storage rate from pricing JSON, falling back to built-in default."""
+def _load_s3_standard_rate() -> Optional[float]:
+    """Load S3 Standard storage rate from pricing JSON; None (renders N/A) when unavailable."""
     pricing_file = Path(__file__).parent.parent / 'reference' / 's3-pricing.json'
     try:
         with open(pricing_file, encoding='utf-8') as fh:
             data = json.load(fh)
-        return float(data.get('rates', {}).get('STANDARD', 0.023))
+        rate = data.get('rates', {}).get('STANDARD')
+        return float(rate) if rate is not None else None
     except Exception:
-        return 0.023
+        return None
 
 
 def _build_bucket_row(bucket, region, storage_lens_data, standard_rate, account_id):
@@ -356,7 +358,10 @@ def _build_bucket_row(bucket, region, storage_lens_data, standard_rate, account_
     owner_id = utils.get_account_name_formatted(account_id)
 
     # Estimate monthly storage cost (Standard tier only)
-    if size_source != "Not Available" and size_mb > 0:
+    if standard_rate is None:
+        monthly_cost = 'N/A'
+        cost_note = 'S3 Standard rate unavailable'
+    elif size_source != "Not Available" and size_mb > 0:
         monthly_cost = round(size_mb / 1024 * standard_rate, 4)
         cost_note = 'Standard storage estimate only'
     elif size_source != "Not Available":
