@@ -227,11 +227,11 @@ def collect_attacks() -> list[dict[str, Any]]:
         utils.log_info(f"Querying attacks from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}")
 
         # List attacks
-        response = client.list_attacks(
+        attack_summaries = []
+        for page in client.get_paginator('list_attacks').paginate(
             StartTime={'FromInclusive': start_time, 'ToExclusive': end_time}
-        )
-
-        attack_summaries = response.get('AttackSummaries', [])
+        ):
+            attack_summaries.extend(page.get('AttackSummaries', []))
 
         if not attack_summaries:
             utils.log_info("No Shield attacks found in the last 90 days")
@@ -750,10 +750,10 @@ def main():
             print("  - AWS CLI: aws configure")
             print("  - Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
             print("  - IAM role (if running on EC2)")
-            return
+            sys.exit(1)
         except Exception as e:
             utils.log_error("Error validating AWS credentials", e)
-            return
+            sys.exit(1)
 
         utils.log_info("Checking AWS Shield Advanced subscription status...")
         print("====================================================================")

@@ -871,10 +871,9 @@ def run_org_scan() -> None:
 
     # Confirm
     n_accounts = len(cross_account_roles)
-    answer = input(
-        f"\nRun [{selected_script['name']}] across {n_accounts} account(s)? (y/n): "
-    ).strip().lower()
-    if answer != "y":
+    if not utils.prompt_for_confirmation(
+        f"\nRun [{selected_script['name']}] across {n_accounts} account(s)?", default=False
+    ):
         return
 
     script_file: Path = selected_script["file"]

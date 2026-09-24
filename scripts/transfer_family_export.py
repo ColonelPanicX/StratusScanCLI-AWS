@@ -273,13 +273,8 @@ def collect_transfer_users(region: str, server_ids: list[str]) -> list[dict[str,
                     response = transfer_client.describe_user(ServerId=server_id, UserName=username)
                     user = response['User']
 
-                    # Count SSH public keys
-                    ssh_key_count = 0
-                    try:
-                        keys_response = transfer_client.list_ssh_public_keys(ServerId=server_id, UserName=username)
-                        ssh_key_count = len(keys_response.get('SshPublicKeys', []))
-                    except Exception:
-                        pass
+                    # DescribeUser returns the user's SSH public keys; Transfer has no ListSshPublicKeys operation.
+                    ssh_key_count = len(user.get('SshPublicKeys', []))
 
                     user_info = {
                         'Server ID': server_id,

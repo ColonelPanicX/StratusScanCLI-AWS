@@ -4,9 +4,10 @@ ACM Private CA Export Script for StratusScan
 
 Exports comprehensive AWS Certificate Manager Private Certificate Authority information including:
 - Private Certificate Authorities with configuration details
-- Issued certificates and certificate templates
-- Certificate revocation lists (CRLs)
-- Audit reports and permissions
+- Certificate revocation list (CRL) configuration
+- CA permissions
+
+Not collected: issued certificates (ACM-PCA has no list API) and audit reports.
 
 Output: Multi-worksheet Excel file with ACM Private CA resources
 """

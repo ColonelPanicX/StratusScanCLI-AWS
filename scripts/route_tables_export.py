@@ -452,6 +452,7 @@ def main():
         print("\nOperation cancelled by user.")
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -335,8 +335,9 @@ def scan_access_points_in_region(region: str) -> list[dict[str, Any]]:
         efs_client = utils.get_boto3_client('efs', region_name=region)
 
         # Get access points
-        response = efs_client.describe_access_points()
-        access_points = response.get('AccessPoints', [])
+        access_points = []
+        for page in efs_client.get_paginator('describe_access_points').paginate():
+            access_points.extend(page.get('AccessPoints', []))
 
         for ap in access_points:
             access_point_id = ap.get('AccessPointId', '')

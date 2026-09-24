@@ -761,7 +761,7 @@ def main():
             print("  - AWS CLI: aws configure")
             print("  - Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
             print("  - IAM role (if running on EC2)")
-            return
+            sys.exit(1)
 
         # Check if Compute Optimizer is enabled. This is a courtesy pre-flight
         # gate for interactive users only — under AUTO_RUN (bundle / --run-all /

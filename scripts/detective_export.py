@@ -23,7 +23,7 @@ Features:
 Prerequisites:
 - AWS Detective must be enabled in the target account
 - Requires IAM permissions: detective:ListGraphs, detective:ListMembers, detective:ListInvitations,
-  detective:GetMembers, detective:DescribeOrganizationConfiguration
+  detective:DescribeOrganizationConfiguration
 - Regional service - scans multiple regions
 """
 
@@ -507,10 +507,10 @@ def main():
             print("  - AWS CLI: aws configure")
             print("  - Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
             print("  - IAM role (if running on EC2)")
-            return
+            sys.exit(1)
         except Exception as e:
             utils.log_error("Error validating AWS credentials", e)
-            return
+            sys.exit(1)
 
         utils.log_info("Starting AWS Detective information collection...")
         print("====================================================================")

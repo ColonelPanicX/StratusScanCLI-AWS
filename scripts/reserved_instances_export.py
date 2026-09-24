@@ -290,9 +290,11 @@ def _scan_opensearch_ri_region(region: str) -> list[dict[str, Any]]:
     opensearch = utils.get_boto3_client('es', region_name=region)  # 'es' is the service name
     reserved_instances = []
 
-    response = opensearch.describe_reserved_elasticsearch_instances()
+    ris = []
+    for page in opensearch.get_paginator('describe_reserved_elasticsearch_instances').paginate():
+        ris.extend(page.get('ReservedElasticsearchInstances', []))
 
-    for ri in response.get('ReservedElasticsearchInstances', []):
+    for ri in ris:
         try:
             reserved_instances.append(_build_opensearch_ri_row(ri, region))
         except Exception as e:

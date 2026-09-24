@@ -499,8 +499,9 @@ def get_account_tags(org_client, account_id):
         str: Formatted tags string
     """
     try:
-        response = org_client.list_tags_for_resource(ResourceId=account_id)
-        tags = response.get('Tags', [])
+        tags = []
+        for page in org_client.get_paginator('list_tags_for_resource').paginate(ResourceId=account_id):
+            tags.extend(page.get('Tags', []))
 
         if tags:
             tag_strings = [f"{tag.get('Key', 'Unknown')}={tag.get('Value', 'Unknown')}" for tag in tags]
@@ -930,10 +931,10 @@ def main():
             print("  - AWS CLI: aws configure")
             print("  - Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
             print("  - IAM role (if running on EC2)")
-            return
+            sys.exit(1)
         except Exception as e:
             utils.log_error("Error validating AWS credentials", e)
-            return
+            sys.exit(1)
 
         utils.log_info("Starting Organizations information collection from AWS...")
         print("====================================================================")
