@@ -551,7 +551,7 @@ def get_menu_structure():
                 "1": {
                     "name": "IAM",
                     "file": scripts_dir / "iam_export.py",
-                    "description": "Export IAM users, roles, and policies"
+                    "description": "Export IAM users, groups, roles, and policies"
                 },
                 "2": {
                     "name": "IAM Identity Center",

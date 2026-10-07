@@ -14,11 +14,16 @@ exporting IAM Users, Roles, Policies, or all resources in a single comprehensive
 workbook. All data is exported to Excel format with AWS-specific naming conventions
 for security auditing and compliance reporting.
 
-Menu:
+Menu (numbers 1-4 are unchanged from earlier versions; Groups is appended as 5):
   1. IAM Users
   2. IAM Roles
   3. IAM Policies
-  4. All IAM Resources (Users + Roles + Policies)
+  4. All IAM Resources (Users + Groups + Roles + Policies + Inline Policies)
+  5. IAM Groups
+
+Unattended runs (STRATUSSCAN_AUTO_RUN, i.e. Smart Scan / --run-all / org-scan)
+skip the menu and run option 4. utils.prompt_menu answers 1 in auto-run, which
+used to mean "Users only" (Issue #309).
 """
 
 import datetime
@@ -42,7 +47,7 @@ except ImportError:
     except ImportError:
         print("ERROR: Could not import the utils module. Make sure utils.py is in the StratusScan directory.")
         sys.exit(1)
-args = utils.parse_script_args("Export IAM users, roles, and policies to Excel")
+args = utils.parse_script_args("Export IAM users, groups, roles, and policies to Excel")
 
 
 # ---------------------------------------------------------------------------
@@ -115,28 +120,103 @@ def get_user_groups(iam_client, username):
     return ", ".join(groups) if groups else "None"
 
 
-@utils.aws_error_handler("Getting user policies", default_return="Unknown")
-def get_user_policies(iam_client, username):
+# Excel cell limit is 32,767 characters; stay under it for member lists.
+_MAX_CELL_CHARS = 32000
+
+CHOICE_USERS = 1
+CHOICE_ROLES = 2
+CHOICE_POLICIES = 3
+CHOICE_ALL = 4
+CHOICE_GROUPS = 5
+
+
+def error_code(exc: Exception) -> str:
+    """Return the AWS error code for a ClientError, else the exception class name."""
+    if isinstance(exc, ClientError):
+        return exc.response.get('Error', {}).get('Code', 'Unknown')
+    return type(exc).__name__
+
+
+def unavailable(exc: Exception) -> str:
+    """Cell text for a value that could not be read: ``Unavailable (<ErrorCode>)``."""
+    return f"Unavailable ({error_code(exc)})"
+
+
+def _join_capped(names, total=None):
+    """Join names with ', ' and cap the result below the Excel cell limit.
+
+    The cap is stated in the cell (never silent); the full count lives in the
+    adjacent count column.
     """
-    Get all policies attached to a user (both attached and inline).
+    text = ", ".join(names)
+    if len(text) <= _MAX_CELL_CHARS:
+        return text
+    kept = []
+    size = 0
+    for name in names:
+        if size + len(name) + 2 > _MAX_CELL_CHARS - 60:
+            break
+        kept.append(name)
+        size += len(name) + 2
+    return ", ".join(kept) + f" ... (+{len(names) - len(kept)} more; list truncated at the Excel cell limit)"
+
+
+# (attached-policies operation, attached paginator result key, inline operation)
+_POLICY_OPS = {
+    'User': ('list_attached_user_policies', 'UserName', 'list_user_policies'),
+    'Group': ('list_attached_group_policies', 'GroupName', 'list_group_policies'),
+    'Role': ('list_attached_role_policies', 'RoleName', 'list_role_policies'),
+}
+
+
+def list_entity_policies(iam_client, entity_type, entity_name):
+    """
+    List the managed and inline policy names for a user, group or role.
+
+    Both operations are paginated (default page 100 items per the IAM API
+    reference), so an entity with more than 100 attachments is read in full.
+    Raises on any AWS error: the caller states the failure in the row.
 
     Args:
         iam_client: The boto3 IAM client
-        username: The username to check
+        entity_type: 'User', 'Group' or 'Role'
+        entity_name: The user, group or role name
 
     Returns:
-        str: Comma-separated list of policy names or descriptive string
+        tuple: (attached_managed_policy_names, inline_policy_names), both lists
     """
-    policies = []
-    attached_policies = iam_client.list_attached_user_policies(UserName=username)
-    for policy in attached_policies['AttachedPolicies']:
-        policies.append(policy['PolicyName'])
+    attached_op, name_arg, inline_op = _POLICY_OPS[entity_type]
+    attached = []
+    for page in iam_client.get_paginator(attached_op).paginate(**{name_arg: entity_name}):
+        attached.extend(p['PolicyName'] for p in page.get('AttachedPolicies', []))
+    inline = []
+    for page in iam_client.get_paginator(inline_op).paginate(**{name_arg: entity_name}):
+        inline.extend(page.get('PolicyNames', []))
+    return attached, inline
 
-    inline_policies = iam_client.list_user_policies(UserName=username)
-    for policy_name in inline_policies['PolicyNames']:
-        policies.append(f"{policy_name} (Inline)")
 
-    return ", ".join(policies) if policies else "None"
+def policy_columns(iam_client, entity_type, entity_name):
+    """
+    Build the policy columns for an entity row.
+
+    Returns:
+        tuple: (permission_policies, attached_managed, inline_count, note) where
+        every value reads ``Unavailable (<ErrorCode>)`` and note carries the
+        error text when the lookup failed. Nothing is guessed.
+    """
+    try:
+        attached, inline = list_entity_policies(iam_client, entity_type, entity_name)
+    except Exception as e:
+        utils.log_warning(f"Could not list policies for {entity_type.lower()} {entity_name}: {e}")
+        text = unavailable(e)
+        return text, text, text, f"Policy lookup failed: {e}"
+    combined = attached + [f"{n} (Inline)" for n in inline]
+    return (
+        ", ".join(combined) if combined else "None",
+        ", ".join(attached) if attached else "None",
+        len(inline),
+        "",
+    )
 
 
 def get_password_info(iam_client, username):
@@ -248,7 +328,7 @@ def _build_user_row(iam_client, user):
     mfa_status = get_user_mfa_devices(iam_client, username)
     password_age, console_access = get_password_info(iam_client, username)
     access_key_id, active_key_age, access_key_last_used = get_access_key_info(iam_client, username)
-    permission_policies = get_user_policies(iam_client, username)
+    permission_policies, attached_managed, inline_count, note = policy_columns(iam_client, 'User', username)
 
     return {
         'User Name': username,
@@ -261,7 +341,11 @@ def _build_user_row(iam_client, user):
         'Access Key Last Used': access_key_last_used,
         'Creation Date': creation_date,
         'Console Access': console_access,
-        'Permission Policies': permission_policies
+        'Permission Policies': permission_policies,
+        # Appended at the END: the asset registry keys on column positions.
+        'Attached Managed Policies': attached_managed,
+        'Inline Policy Count': inline_count,
+        'Collection Note': note,
     }
 
 
@@ -499,31 +583,6 @@ def determine_role_type(role_name, role_path, trust_policy_doc):
     return "Standard"
 
 
-@utils.aws_error_handler("Getting role policies", default_return="Unknown")
-def get_role_policies(iam_client, role_name):
-    """
-    Get all policies attached to a role (both managed and inline).
-
-    Args:
-        iam_client: The boto3 IAM client
-        role_name: The role name to check
-
-    Returns:
-        str: Comma-separated list of policy names
-    """
-    policies = []
-
-    attached_policies = iam_client.list_attached_role_policies(RoleName=role_name)
-    for policy in attached_policies['AttachedPolicies']:
-        policies.append(policy['PolicyName'])
-
-    inline_policies = iam_client.list_role_policies(RoleName=role_name)
-    for policy_name in inline_policies['PolicyNames']:
-        policies.append(f"{policy_name} (Inline)")
-
-    return ", ".join(policies) if policies else "None"
-
-
 @utils.aws_error_handler("Getting role tags", default_return="Unknown")
 def get_role_tags(iam_client, role_name):
     """
@@ -570,24 +629,38 @@ def _build_role_row(iam_client, role):
 
     role_type = determine_role_type(role_name, role_path, trust_policy_doc)
 
+    notes = []
+    # ListRoles does not return PermissionsBoundary, RoleLastUsed or Tags (IAM
+    # API reference, ListRoles), so these come from GetRole.
     try:
         role_usage = iam_client.get_role(RoleName=role_name)
-        role_last_used = role_usage['Role'].get('RoleLastUsed', {})
+        role_detail = role_usage['Role']
+        role_last_used = role_detail.get('RoleLastUsed', {})
         last_used_date = role_last_used.get('LastUsedDate')
 
         if last_used_date:
             last_used_str = last_used_date.strftime('%Y-%m-%d %H:%M:%S UTC')
             days_since_used = calculate_days_since_last_used(last_used_date)
+            last_used_region = role_last_used.get('Region') or "Not Reported"
         else:
             last_used_str = "Never"
             days_since_used = "Never"
+            last_used_region = "Never"
+
+        boundary = role_detail.get('PermissionsBoundary', {}).get('PermissionsBoundaryArn')
+        permissions_boundary = boundary if boundary else "None"
 
     except Exception as e:
         utils.log_warning(f"Could not get usage info for role {role_name}: {e}")
         last_used_str = "Unknown"
         days_since_used = "Unknown"
+        last_used_region = unavailable(e)
+        permissions_boundary = unavailable(e)
+        notes.append(f"GetRole failed: {e}")
 
-    permission_policies = get_role_policies(iam_client, role_name)
+    permission_policies, _attached, inline_count, policy_note = policy_columns(iam_client, 'Role', role_name)
+    if policy_note:
+        notes.append(policy_note)
     tags = get_role_tags(iam_client, role_name)
 
     return {
@@ -604,7 +677,14 @@ def _build_role_row(iam_client, role):
         'Creation Date': creation_date,
         'Path': role_path,
         'Description': description,
-        'Tags': tags
+        'Tags': tags,
+        # Appended at the END: the asset registry keys on column positions.
+        'Role ARN': role.get('Arn', 'Unknown'),
+        'Service-Linked': 'Yes' if role_path.startswith('/aws-service-role/') else 'No',
+        'Permissions Boundary': permissions_boundary,
+        'Inline Policy Count': inline_count,
+        'Last Used Region': last_used_region,
+        'Collection Note': "; ".join(notes),
     }
 
 
@@ -668,6 +748,108 @@ def collect_iam_role_information():
 
     utils.log_success(f"Successfully collected information for {len(role_data)} roles")
     return role_data
+
+
+# ---------------------------------------------------------------------------
+# Group helper functions (Issue #309)
+# ---------------------------------------------------------------------------
+
+def _build_group_row(iam_client, group):
+    """
+    Build the export row for a single IAM group.
+
+    Members come from GetGroup (paginated on Marker/IsTruncated), attached
+    managed and inline policies from the paginated List*GroupPolicies calls.
+    Any per-column failure is stated in that row as
+    ``Unavailable (<ErrorCode>)`` with the AWS text in ``Collection Note``.
+
+    Args:
+        iam_client: The boto3 IAM client.
+        group (dict): A single Groups entry from list_groups.
+
+    Returns:
+        dict: The assembled group row.
+    """
+    group_name = group.get('GroupName', 'Unknown')
+    create_date = group.get('CreateDate')
+    creation_date = create_date.strftime('%Y-%m-%d %H:%M:%S UTC') if create_date else "Unknown"
+    notes = []
+
+    try:
+        members = []
+        for page in iam_client.get_paginator('get_group').paginate(GroupName=group_name):
+            members.extend(u['UserName'] for u in page.get('Users', []))
+        members_text = _join_capped(members) if members else "None"
+        member_count = len(members)
+    except Exception as e:
+        utils.log_warning(f"Could not list members of group {group_name}: {e}")
+        members_text = unavailable(e)
+        member_count = unavailable(e)
+        notes.append(f"GetGroup failed: {e}")
+
+    _permission, attached_managed, inline_count, policy_note = policy_columns(iam_client, 'Group', group_name)
+    if policy_note:
+        notes.append(policy_note)
+
+    return {
+        'Group Name': group_name,
+        'Group ARN': group.get('Arn', 'Unknown'),
+        'Path': group.get('Path', '/'),
+        'Creation Date': creation_date,
+        'Members': members_text,
+        'Member Count': member_count,
+        'Attached Managed Policies': attached_managed,
+        'Inline Policy Count': inline_count,
+        'Collection Note': "; ".join(notes),
+    }
+
+
+def collect_iam_group_information():
+    """
+    Collect IAM group information from AWS.
+
+    Same failure contract as collect_iam_user_information: account-scope
+    failures (client creation, ListGroups pagination) raise so the caller
+    records the scope as failed rather than empty; per-group column failures
+    are stated in the row, and a group whose row cannot be built at all is
+    logged and counted as skipped.
+
+    Returns:
+        list: List of dictionaries containing group information
+
+    Raises:
+        Exception: Any AWS/pagination error for the account scope.
+    """
+    utils.log_info("Collecting IAM group information from AWS environment...")
+
+    home_region = utils.get_partition_default_region()
+    iam_client = utils.get_boto3_client('iam', region_name=home_region)
+
+    groups = []
+    for page in iam_client.get_paginator('list_groups').paginate():
+        groups.extend(page.get('Groups', []))
+
+    utils.log_info(f"Found {len(groups)} IAM groups to process")
+
+    group_data = []
+    skipped = 0
+    for index, group in enumerate(groups, 1):
+        group_name = group.get('GroupName', 'Unknown')
+        utils.log_info(f"Processing group {index}/{len(groups)}: {group_name}")
+        try:
+            group_data.append(_build_group_row(iam_client, group))
+        except Exception as e:
+            skipped += 1
+            utils.log_error(f"Skipping IAM group '{group_name}' due to a processing error", e)
+
+    if skipped:
+        utils.log_warning(
+            f"{skipped} of {len(groups)} IAM group(s) were skipped due to processing "
+            "errors (see log above); the remaining groups were still collected."
+        )
+
+    utils.log_success(f"Successfully collected information for {len(group_data)} groups")
+    return group_data
 
 
 # ---------------------------------------------------------------------------
@@ -800,10 +982,13 @@ def analyze_policy_document(policy_doc):
     return analysis
 
 
-@utils.aws_error_handler("Getting policy entities", default_return=('Unknown', 'Unknown', 'Unknown', 0))
 def get_policy_entities(iam_client, policy_arn):
     """
     Get entities (users, groups, roles) attached to a policy.
+
+    Raises on AWS errors. It used to return a zero count on failure, which made
+    a policy whose lookup failed read as 'Unused'; the caller now states the
+    failure instead.
 
     Args:
         iam_client: The boto3 IAM client
@@ -961,8 +1146,29 @@ def process_managed_policy(iam_client, policy, policy_type):
                 'risk_level': 'Unknown'
             }
 
-        attached_users, attached_groups, attached_roles, total_attachments = get_policy_entities(iam_client, policy_arn)
-        usage_status = 'Used' if total_attachments > 0 else 'Unused'
+        notes = []
+        if analysis['risk_level'] == 'Unknown':
+            notes.append("Policy document could not be read; analysis columns are Unknown")
+        api_count = policy.get('AttachmentCount')
+        try:
+            attached_users, attached_groups, attached_roles, total_attachments = get_policy_entities(iam_client, policy_arn)
+            attached_flag = 'Yes' if total_attachments > 0 else 'No'
+            usage_status = 'Used' if total_attachments > 0 else 'Unused'
+        except Exception as e:
+            utils.log_warning(f"Could not list entities for policy {policy_name}: {e}")
+            text = unavailable(e)
+            attached_users = attached_groups = attached_roles = text
+            notes.append(f"ListEntitiesForPolicy failed: {e}")
+            # AttachmentCount is reported by ListPolicies itself, so it is a
+            # real API value, not an inference. Absent -> state unavailable.
+            if isinstance(api_count, int):
+                total_attachments = api_count
+                attached_flag = 'Yes' if api_count > 0 else 'No'
+                usage_status = 'Used' if api_count > 0 else 'Unused'
+            else:
+                total_attachments = text
+                attached_flag = text
+                usage_status = text
 
         return {
             'Policy Name': policy_name,
@@ -987,7 +1193,10 @@ def process_managed_policy(iam_client, policy, policy_type):
             'Path': path,
             'Description': description,
             'Usage Status': usage_status,
-            'Risk Level': analysis['risk_level']
+            'Risk Level': analysis['risk_level'],
+            # Appended at the END: the asset registry keys on column positions.
+            'Attached To Anything': attached_flag,
+            'Collection Note': "; ".join(notes),
         }
 
     except Exception as e:
@@ -1145,7 +1354,9 @@ def process_inline_policy(iam_client, entity_type, entity_name, policy_name):
             'Path': 'N/A',
             'Description': f"Inline policy attached to {entity_type.lower()}: {entity_name}",
             'Usage Status': 'Used',
-            'Risk Level': analysis['risk_level']
+            'Risk Level': analysis['risk_level'],
+            'Attached To Anything': 'Yes',
+            'Collection Note': '',
         }
 
     except Exception as e:
@@ -1214,6 +1425,51 @@ def _export_users_to_excel(user_data, account_id, account_name):
         else:
             utils.log_error("Error exporting to Excel. Please check the logs.")
             return None
+
+    except Exception as e:
+        utils.log_error("Error exporting to Excel", e)
+        return None
+
+
+def _export_groups_to_excel(group_data, account_id, account_name):
+    """
+    Export IAM group data to Excel file.
+
+    Args:
+        group_data: List of group information dictionaries
+        account_id: AWS account ID
+        account_name: AWS account name
+
+    Returns:
+        str: Filename of exported file or None if failed
+    """
+    if not group_data:
+        utils.log_warning("No IAM group data to export.")
+        return None
+
+    try:
+        import pandas as pd
+
+        df = utils.sanitize_for_export(utils.prepare_dataframe_for_export(pd.DataFrame(group_data)))
+
+        current_date = datetime.datetime.now().strftime("%m.%d.%Y")
+        filename = utils.create_export_filename(account_name, "iam-groups", "", current_date)
+
+        counts = pd.to_numeric(df['Member Count'], errors='coerce')
+        summary_df = pd.DataFrame({
+            'Metric': ['Total Groups', 'Groups with No Members', 'Groups with Member Lookup Failures'],
+            'Count': [len(df), int((counts == 0).sum()), int(counts.isna().sum())],
+        })
+
+        output_path = utils.save_multiple_dataframes_to_excel({'IAM Groups': df, 'Summary': summary_df}, filename)
+
+        if output_path:
+            utils.log_success("AWS IAM group data exported successfully!")
+            utils.log_success(f"File location: {output_path}")
+            utils.log_info(f"Export contains data for {len(group_data)} IAM groups")
+            return str(output_path)
+        utils.log_error("Error exporting to Excel. Please check the logs.")
+        return None
 
     except Exception as e:
         utils.log_error("Error exporting to Excel", e)
@@ -1338,8 +1594,9 @@ def _export_policies_to_excel(managed_policies, inline_policies, account_id, acc
             policies_with_wildcards = len(all_df[(all_df['Has Wildcard Actions'] == 'Yes') | (all_df['Has Wildcard Resources'] == 'Yes')])
             policies_without_conditions = len(all_df[all_df['Condition Usage'] == 'No'])
 
-            max_attachments = all_df['Attached To Count'].max() if 'Attached To Count' in all_df.columns else 0
-            most_attached = all_df[all_df['Attached To Count'] == max_attachments]['Policy Name'].iloc[0] if max_attachments > 0 else 'None'
+            counts = pd.to_numeric(all_df['Attached To Count'], errors='coerce')
+            max_attachments = int(counts.max()) if counts.notna().any() else 0
+            most_attached = all_df[counts == max_attachments]['Policy Name'].iloc[0] if max_attachments > 0 else 'None'
 
             recently_created = 0
             old_policies = 0
@@ -1444,21 +1701,30 @@ def _export_policies_to_excel(managed_policies, inline_policies, account_id, acc
         return None
 
 
-def _export_comprehensive_to_excel(users_data, roles_data, policies_data, account_id, account_name):
+def _export_comprehensive_to_excel(users_data, roles_data, policies_data, account_id, account_name,
+                                   groups_data=None, inline_policies_data=None):
     """
-    Export comprehensive IAM data (users, roles, policies) to a single Excel workbook.
+    Export comprehensive IAM data (users, roles, customer managed policies,
+    groups, inline policies) to a single Excel workbook.
+
+    Sheet names for users, roles and policies are unchanged; Groups and Inline
+    Policies sheets are added after them and before Summary.
 
     Args:
         users_data: List of user information dictionaries
         roles_data: List of role information dictionaries
-        policies_data: List of policy information dictionaries
+        policies_data: List of customer managed policy information dictionaries
         account_id: AWS account ID
         account_name: AWS account name
+        groups_data: List of group information dictionaries (optional)
+        inline_policies_data: List of inline policy dictionaries (optional)
 
     Returns:
         str: Filename of exported file or None if failed
     """
-    if not users_data and not roles_data and not policies_data:
+    groups_data = groups_data or []
+    inline_policies_data = inline_policies_data or []
+    if not (users_data or roles_data or policies_data or groups_data or inline_policies_data):
         utils.log_warning("No IAM data to export.")
         return None
 
@@ -1485,6 +1751,14 @@ def _export_comprehensive_to_excel(users_data, roles_data, policies_data, accoun
             policies_df = utils.sanitize_for_export(utils.prepare_dataframe_for_export(policies_df))
             data_frames['IAM Policies'] = policies_df
 
+        if groups_data:
+            groups_df = pd.DataFrame(groups_data)
+            data_frames['IAM Groups'] = utils.sanitize_for_export(utils.prepare_dataframe_for_export(groups_df))
+
+        if inline_policies_data:
+            inline_df = pd.DataFrame(inline_policies_data)
+            data_frames['IAM Inline Policies'] = utils.sanitize_for_export(utils.prepare_dataframe_for_export(inline_df))
+
         summary_data = {
             'Category': [
                 'IAM Users',
@@ -1504,7 +1778,12 @@ def _export_comprehensive_to_excel(users_data, roles_data, policies_data, accoun
                 'IAM Policies - Customer Managed',
                 'IAM Policies - Unused',
                 'IAM Policies - High Risk',
-                'IAM Policies - With Wildcards'
+                'IAM Policies - With Wildcards',
+                '',
+                'IAM Groups',
+                'IAM Groups - With No Members',
+                '',
+                'IAM Inline Policies'
             ],
             'Count': [
                 len(users_data),
@@ -1524,7 +1803,12 @@ def _export_comprehensive_to_excel(users_data, roles_data, policies_data, accoun
                 len([p for p in policies_data if p.get('Policy Type') == 'Customer Managed']) if policies_data else 0,
                 len([p for p in policies_data if p.get('Usage Status') == 'Unused']) if policies_data else 0,
                 len([p for p in policies_data if p.get('Risk Level') == 'High']) if policies_data else 0,
-                len([p for p in policies_data if p.get('Has Wildcard Actions') == 'Yes' or p.get('Has Wildcard Resources') == 'Yes']) if policies_data else 0
+                len([p for p in policies_data if p.get('Has Wildcard Actions') == 'Yes' or p.get('Has Wildcard Resources') == 'Yes']) if policies_data else 0,
+                '',
+                len(groups_data),
+                len([g for g in groups_data if g.get('Member Count') == 0]),
+                '',
+                len(inline_policies_data)
             ]
         }
 
@@ -1536,7 +1820,10 @@ def _export_comprehensive_to_excel(users_data, roles_data, policies_data, accoun
         if output_path:
             utils.log_success("AWS comprehensive IAM data exported successfully!")
             utils.log_success(f"File location: {output_path}")
-            utils.log_info(f"Export contains {len(users_data)} users, {len(roles_data)} roles, and {len(policies_data)} policies")
+            utils.log_info(
+                f"Export contains {len(users_data)} users, {len(groups_data)} groups, {len(roles_data)} roles, "
+                f"{len(policies_data)} customer managed policies and {len(inline_policies_data)} inline policies"
+            )
             return str(output_path)
         else:
             utils.log_error("Error exporting to Excel. Please check the logs.")
@@ -1648,12 +1935,38 @@ def _run_policies_export(account_id, account_name, include_aws_managed=False):
         sys.exit(1)
 
 
+def _run_groups_export(account_id, account_name):
+    """Collect IAM groups and export to Excel. See _run_users_export for the
+    account-scope failure-handling rationale."""
+    utils.log_info("Starting IAM group information collection from AWS...")
+
+    failed_scopes = []
+    try:
+        group_data = collect_iam_group_information()
+    except Exception as e:
+        failed_scopes.append(("iam-groups", str(e)))
+        group_data = []
+
+    if group_data:
+        _export_groups_to_excel(group_data, account_id, account_name)
+    elif not failed_scopes:
+        utils.log_warning("No IAM group data collected.")
+
+    if failed_scopes:
+        utils.report_collection_failures(account_name, "iam-groups", failed_scopes)
+        print(
+            "\nERROR: IAM export completed with failures — data is incomplete. "
+            "See the *-iam-groups-FAILED-*.txt marker in the output directory."
+        )
+        sys.exit(1)
+
+
 def _run_comprehensive_export(account_id, account_name):
     """Collect all IAM resources and export to a single comprehensive
     workbook. See _run_users_export for the account-scope failure-handling
-    rationale. Users, roles, and managed policies are tracked as separate
-    scopes so a failure in one phase does not discard data already collected
-    from the others."""
+    rationale. Users, groups, roles, customer managed policies and inline
+    policies are tracked as separate scopes so a failure in one phase does not
+    discard data already collected from the others."""
     utils.log_info("Starting comprehensive IAM information collection from AWS...")
 
     failed_scopes = []
@@ -1672,17 +1985,42 @@ def _run_comprehensive_export(account_id, account_name):
         failed_scopes.append(("iam-roles", str(e)))
         roles_data = []
 
+    policies_data = []
+    inline_policies_data = []
     utils.log_info("Phase 3: Collecting IAM Policies (Customer Managed)...")
     try:
         home_region = utils.get_partition_default_region()
         iam_client = utils.get_boto3_client('iam', region_name=home_region)
-        policies_data = collect_managed_policies(iam_client, include_aws_managed=False)
     except Exception as e:
+        # No client: both policy scopes fail, each stated by name.
         failed_scopes.append(("iam-managed-policies", str(e)))
-        policies_data = []
+        failed_scopes.append(("iam-inline-policies", str(e)))
+        iam_client = None
 
-    if users_data or roles_data or policies_data:
-        _export_comprehensive_to_excel(users_data, roles_data, policies_data, account_id, account_name)
+    if iam_client is not None:
+        try:
+            policies_data = collect_managed_policies(iam_client, include_aws_managed=False)
+        except Exception as e:
+            failed_scopes.append(("iam-managed-policies", str(e)))
+
+        utils.log_info("Phase 4: Collecting IAM Inline Policies...")
+        try:
+            inline_policies_data = collect_inline_policies(iam_client)
+        except Exception as e:
+            failed_scopes.append(("iam-inline-policies", str(e)))
+
+    utils.log_info("Phase 5: Collecting IAM Groups...")
+    try:
+        groups_data = collect_iam_group_information()
+    except Exception as e:
+        failed_scopes.append(("iam-groups", str(e)))
+        groups_data = []
+
+    if users_data or roles_data or policies_data or groups_data or inline_policies_data:
+        _export_comprehensive_to_excel(
+            users_data, roles_data, policies_data, account_id, account_name,
+            groups_data=groups_data, inline_policies_data=inline_policies_data,
+        )
     elif not failed_scopes:
         utils.log_warning("No IAM data collected.")
 
@@ -1708,9 +2046,19 @@ def main():
         utils.setup_logging("iam-export")
         account_id, account_name = utils.print_script_banner("AWS IAM RESOURCES EXPORT")
 
+        include_aws_managed = False
+
+        # utils.prompt_menu answers 1 in auto-run, which is "Users" here, so an
+        # unattended run (Smart Scan / --run-all / org-scan) exported users only
+        # (Issue #309). Select the comprehensive export explicitly instead.
+        if utils.is_auto_run():
+            utils.log_info("Unattended run: exporting all IAM resources (users, groups, roles, policies).")
+            _run_comprehensive_export(account_id, account_name)
+            print("\nScript execution completed.")
+            return
+
         step = 1
         choice = None
-        include_aws_managed = False
 
         while True:
             if step == 1:
@@ -1721,7 +2069,8 @@ def main():
                             "IAM Users",
                             "IAM Roles",
                             "IAM Policies",
-                            "All IAM Resources (Users + Roles + Policies)",
+                            "All IAM Resources (Users + Groups + Roles + Policies)",
+                            "IAM Groups",
                         ],
                     )
                 except utils.BackSignal:
@@ -1733,7 +2082,7 @@ def main():
 
             elif step == 2:
                 # Policy scope sub-menu only for choice 3 (Policies)
-                if choice == 3:
+                if choice == CHOICE_POLICIES:
                     try:
                         result = utils.prompt_menu(
                             "POLICY SCOPE",
@@ -1757,12 +2106,13 @@ def main():
                     1: "IAM Users",
                     2: "IAM Roles",
                     3: f"IAM Policies ({'Customer + AWS Managed' if include_aws_managed else 'Customer Managed only'})",
-                    4: "All IAM Resources (Users + Roles + Policies)",
+                    4: "All IAM Resources (Users + Groups + Roles + Policies)",
+                    5: "IAM Groups",
                 }
                 msg = f"Ready to export: {choice_labels[choice]}."
                 result = utils.prompt_confirmation(msg)
                 if result == 'back':
-                    step = 2 if choice == 3 else 1
+                    step = 2 if choice == CHOICE_POLICIES else 1
                     continue
                 if result == 'exit':
                     sys.exit(11)
@@ -1775,8 +2125,10 @@ def main():
                     _run_roles_export(account_id, account_name)
                 elif choice == 3:
                     _run_policies_export(account_id, account_name, include_aws_managed)
-                elif choice == 4:
+                elif choice == CHOICE_ALL:
                     _run_comprehensive_export(account_id, account_name)
+                elif choice == CHOICE_GROUPS:
+                    _run_groups_export(account_id, account_name)
 
                 print("\nScript execution completed.")
                 break
