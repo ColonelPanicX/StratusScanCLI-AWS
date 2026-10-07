@@ -15,8 +15,14 @@ Features:
 - Summary: Application and environment counts with status distribution
 
 Output: Excel file with 5 worksheets
+
+Every resource is exported even when its details cannot be read: unreadable
+configuration templates and application-version lists get a row stating the
+AWS error code and text (see 'Collection Note'). A region-level failure is
+reported via the FAILED marker and a non-zero exit, never as an empty result.
 """
 
+import re
 import sys
 import threading
 from pathlib import Path
@@ -38,6 +44,9 @@ args = utils.parse_script_args("Export Elastic Beanstalk applications and enviro
 NOT_AVAILABLE = 'N/A'
 STATE_NOT_FOUND = 'Not Found'
 _PLATFORM_ARN_MARKER = ':platform/'
+# AWS quotes the ARN in the error text, e.g. "No Platform named 'arn:...' found."
+# Branch names contain spaces, so match up to the closing quote, not whitespace.
+_ERROR_PLATFORM_ARN_RE = re.compile(r"'(arn:[^':]*:elasticbeanstalk:[^']*:platform/[^']+)'")
 
 # Region -> (branch name -> LifecycleState, lookup error state or None).
 # ListPlatformBranches is called at most once per region per run; the
@@ -131,6 +140,64 @@ def platform_columns(region: str, platform_arn: str, solution_stack_name: str) -
     return cols
 
 
+def error_code_and_text(exc: Exception) -> tuple[str, str]:
+    """Return (error code, error text) for a ClientError or BotoCoreError."""
+    if isinstance(exc, ClientError):
+        err = exc.response.get('Error', {})
+        return err.get('Code', 'Unknown'), err.get('Message', '') or str(exc)
+    return type(exc).__name__, str(exc)
+
+
+def unavailable_platform_columns(region: str, code: str, error_text: str) -> dict[str, str]:
+    """
+    Platform columns for a resource whose settings could not be read.
+
+    Every column reads ``Unavailable (<code>)`` unless the AWS error text names
+    a PlatformArn (the retired-platform case). In that case branch, version and
+    ARN come from that ARN through the same parser used for readable rows, and
+    lifecycle state through the same lookup. Nothing is inferred otherwise.
+    """
+    unavailable = f"Unavailable ({code})"
+    cols = {
+        'Platform': unavailable,
+        'Platform Branch': unavailable,
+        'Platform Version': unavailable,
+        'Platform ARN': unavailable,
+        'Solution Stack Name': unavailable,
+        'Platform Branch State': unavailable,
+    }
+    match = _ERROR_PLATFORM_ARN_RE.search(error_text or '')
+    if match:
+        parsed = platform_columns(region, match.group(1), NOT_AVAILABLE)
+        for key in ('Platform Branch', 'Platform Version', 'Platform ARN', 'Platform Branch State'):
+            cols[key] = parsed[key]
+    return cols
+
+
+def _scan_scope(regions: list[str], scan_function: Any, label: str) -> tuple[list[dict[str, Any]], list]:
+    """
+    Run a per-region collector with failure collection.
+
+    The collector must raise on failure. Returns ``(rows, failed)`` where
+    ``failed`` holds ``("<region> (<label>)", error_message)`` tuples.
+    """
+    print(f"\n=== COLLECTING ELASTIC BEANSTALK {label.upper()} ===")
+    utils.log_info(f"Scanning {len(regions)} regions...")
+
+    region_results, failed = utils.scan_regions_concurrent(
+        regions=regions,
+        scan_function=scan_function,
+        show_progress=True,
+        collect_failures=True,
+    )
+    rows: list[dict[str, Any]] = []
+    for region_rows in region_results:
+        rows.extend(region_rows)
+    scoped_failures = [(f"{region} ({label})", msg) for region, msg in failed]
+    utils.log_success(f"Total {label} collected: {len(rows)}")
+    return rows, scoped_failures
+
+
 def _build_application_row(app: dict, region: str) -> dict[str, Any]:
     """Build a single Elastic Beanstalk application export row from a describe response."""
     app_name = app.get('ApplicationName', 'N/A')
@@ -175,6 +242,26 @@ def _build_application_row(app: dict, region: str) -> dict[str, Any]:
         'Max Age (Days)': max_age_days,
         'Created': date_created_str,
         'Updated': date_updated_str,
+        # Appended at the end: consumers key on column positions.
+        'Collection Note': '',
+    }
+
+
+def _unavailable_application_row(app: dict, region: str, exc: Exception) -> dict[str, Any]:
+    """Minimal row for an application whose describe response could not be processed."""
+    unavailable = f"Unavailable ({type(exc).__name__})"
+    return {
+        'Region': region,
+        'Application Name': app.get('ApplicationName') or unavailable,
+        'Description': unavailable,
+        'Version Count': unavailable,
+        'Config Template Count': unavailable,
+        'Service Role': unavailable,
+        'Max Versions': unavailable,
+        'Max Age (Days)': unavailable,
+        'Created': unavailable,
+        'Updated': unavailable,
+        'Collection Note': f"{type(exc).__name__}: {exc}",
     }
 
 
@@ -189,8 +276,8 @@ def collect_applications_from_region(region: str) -> list[dict[str, Any]]:
     silent-collection-loss bug — see
     ``.collab/audit/07.16.2026-silent-collection-failure-blast-radius.md``).
 
-    Individual malformed applications are skipped (logged) rather than
-    aborting the whole region.
+    An application whose response cannot be processed still gets a row
+    (``Unavailable (<reason>)`` plus a ``Collection Note``); it is never skipped.
     """
     if not utils.is_aws_region(region):
         utils.log_error(f"Skipping invalid AWS region: {region}")
@@ -206,13 +293,12 @@ def collect_applications_from_region(region: str) -> list[dict[str, Any]]:
         try:
             applications.append(_build_application_row(app, region))
         except Exception as e:
-            # One malformed application is skipped, not fatal to the region.
             utils.log_error(
-                f"Skipping malformed Elastic Beanstalk application in {region}: "
+                f"Could not process Elastic Beanstalk application in {region}: "
                 f"{app.get('ApplicationName', '<unknown>')}",
                 e,
             )
-            continue
+            applications.append(_unavailable_application_row(app, region, e))
 
     return applications
 
@@ -247,9 +333,13 @@ def collect_applications(regions: list[str]) -> tuple[list[dict[str, Any]], list
     return all_applications, failed_regions
 
 
-@utils.aws_error_handler("Collecting Elastic Beanstalk environments from region", default_return=[])
 def collect_environments_from_region(region: str) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk environment information from a single AWS region."""
+    """
+    Collect Elastic Beanstalk environment information from a single AWS region.
+
+    Does not swallow errors: a failure propagates so the region is recorded as
+    failed rather than reported as having no environments.
+    """
     environments = []
     eb_client = utils.get_boto3_client('elasticbeanstalk', region_name=region)
 
@@ -344,28 +434,19 @@ def collect_environments_from_region(region: str) -> list[dict[str, Any]]:
     return environments
 
 
-def collect_environments(regions: list[str]) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk environment information using concurrent scanning."""
-    print("\n=== COLLECTING ELASTIC BEANSTALK ENVIRONMENTS ===")
-    utils.log_info(f"Scanning {len(regions)} regions...")
-
-    region_results = utils.scan_regions_concurrent(
-        regions=regions,
-        scan_function=collect_environments_from_region,
-        show_progress=True
-    )
-
-    all_environments = []
-    for envs_in_region in region_results:
-        all_environments.extend(envs_in_region)
-
-    utils.log_success(f"Total environments collected: {len(all_environments)}")
-    return all_environments
+def collect_environments(regions: list[str]) -> tuple[list[dict[str, Any]], list]:
+    """Collect Elastic Beanstalk environments; returns ``(rows, failed_scopes)``."""
+    return _scan_scope(regions, collect_environments_from_region, 'environments')
 
 
-@utils.aws_error_handler("Collecting Elastic Beanstalk application versions from region", default_return=[])
 def collect_application_versions_from_region(region: str) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk application version information from a single AWS region."""
+    """
+    Collect Elastic Beanstalk application version information from a single AWS region.
+
+    A region-level failure propagates (region recorded as failed). If one
+    application's version list cannot be read, that application still gets a
+    row stating the AWS error, so it is not silently absent.
+    """
     versions = []
     eb_client = utils.get_boto3_client('elasticbeanstalk', region_name=region)
 
@@ -421,41 +502,74 @@ def collect_application_versions_from_region(region: str) -> list[dict[str, Any]
                     'Description': description,
                     'Created': date_created_str,
                     'Updated': date_updated_str,
+                    'Collection Note': '',
                 })
 
-        except Exception as e:
-            utils.log_warning(f"Could not get versions for application {app_name}: {str(e)}")
-            continue
+        except (ClientError, BotoCoreError) as e:
+            code, error_text = error_code_and_text(e)
+            utils.log_warning(f"Could not get versions for application {app_name}: {code}: {error_text}")
+            unavailable = f"Unavailable ({code})"
+            versions.append({
+                'Region': region,
+                'Application': app_name,
+                'Version Label': unavailable,
+                'Status': unavailable,
+                'Source Location': unavailable,
+                'Build ARN': unavailable,
+                'Description': unavailable,
+                'Created': unavailable,
+                'Updated': unavailable,
+                'Collection Note': error_text,
+            })
 
     return versions
 
 
-def collect_application_versions(regions: list[str]) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk application version information using concurrent scanning."""
-    print("\n=== COLLECTING ELASTIC BEANSTALK APPLICATION VERSIONS ===")
-    utils.log_info(f"Scanning {len(regions)} regions...")
-
-    region_results = utils.scan_regions_concurrent(
-        regions=regions,
-        scan_function=collect_application_versions_from_region,
-        show_progress=True
-    )
-
-    all_versions = []
-    for versions_in_region in region_results:
-        all_versions.extend(versions_in_region)
-
-    utils.log_success(f"Total application versions collected: {len(all_versions)}")
-    return all_versions
+def collect_application_versions(regions: list[str]) -> tuple[list[dict[str, Any]], list]:
+    """Collect Elastic Beanstalk application versions; returns ``(rows, failed_scopes)``."""
+    return _scan_scope(regions, collect_application_versions_from_region, 'application versions')
 
 
-@utils.aws_error_handler("Collecting Elastic Beanstalk configuration templates from region", default_return=[])
+def _template_row(region: str, app_name: str, template_name: str, platform_cols: dict[str, str],
+                  deployment_status: str, description: str, created: str, updated: str,
+                  note: str) -> dict[str, Any]:
+    """Build one Config Templates row. New columns go at the end: consumers key on positions."""
+    return {
+        'Region': region,
+        'Application': app_name,
+        'Template Name': template_name,
+        'Platform': platform_cols['Platform'],
+        'Deployment Status': deployment_status,
+        'Description': description,
+        'Created': created,
+        'Updated': updated,
+        'Platform Branch': platform_cols['Platform Branch'],
+        'Platform Version': platform_cols['Platform Version'],
+        'Platform ARN': platform_cols['Platform ARN'],
+        'Solution Stack Name': platform_cols['Solution Stack Name'],
+        'Platform Branch State': platform_cols['Platform Branch State'],
+        'Collection Note': note,
+    }
+
+
+def _format_date(value: Any) -> str:
+    return value.strftime('%Y-%m-%d %H:%M:%S') if value else 'N/A'
+
+
 def collect_configuration_templates_from_region(region: str) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk configuration template information from a single AWS region."""
-    templates = []
+    """
+    Collect Elastic Beanstalk configuration templates from a single AWS region.
+
+    Every template listed by DescribeApplications yields at least one row. If
+    DescribeConfigurationSettings fails with a ClientError/BotoCoreError (for
+    example a retired platform, or an AMI that no longer resolves), the row
+    states ``Unavailable (<ErrorCode>)`` and carries the AWS error text in
+    ``Collection Note``. Any other exception, and any region-level failure,
+    propagates so the region is recorded as failed.
+    """
+    templates: list[dict[str, Any]] = []
     eb_client = utils.get_boto3_client('elasticbeanstalk', region_name=region)
 
-    # First get all applications
     response = eb_client.describe_applications()
     applications = response.get('Applications', [])
 
@@ -465,75 +579,56 @@ def collect_configuration_templates_from_region(region: str) -> list[dict[str, A
 
         for template_name in config_templates:
             try:
-                # Get template details
                 template_response = eb_client.describe_configuration_settings(
                     ApplicationName=app_name,
                     TemplateName=template_name
                 )
-                config_settings = template_response.get('ConfigurationSettings', [])
-
-                for config in config_settings:
-                    solution_stack_name = config.get('SolutionStackName', 'N/A')
-                    platform_arn = config.get('PlatformArn', 'N/A')
-                    description = config.get('Description', 'N/A')
-                    deployment_status = config.get('DeploymentStatus', 'N/A')
-
-                    # Date created and updated
-                    date_created = config.get('DateCreated')
-                    if date_created:
-                        date_created_str = date_created.strftime('%Y-%m-%d %H:%M:%S')
-                    else:
-                        date_created_str = 'N/A'
-
-                    date_updated = config.get('DateUpdated')
-                    if date_updated:
-                        date_updated_str = date_updated.strftime('%Y-%m-%d %H:%M:%S')
-                    else:
-                        date_updated_str = 'N/A'
-
-                    platform_cols = platform_columns(region, platform_arn, solution_stack_name)
-
-                    templates.append({
-                        'Region': region,
-                        'Application': app_name,
-                        'Template Name': template_name,
-                        'Platform': platform_cols['Platform'],
-                        'Deployment Status': deployment_status,
-                        'Description': description,
-                        'Created': date_created_str,
-                        'Updated': date_updated_str,
-                        # Appended at the end: consumers key on column positions.
-                        'Platform Branch': platform_cols['Platform Branch'],
-                        'Platform Version': platform_cols['Platform Version'],
-                        'Platform ARN': platform_cols['Platform ARN'],
-                        'Solution Stack Name': platform_cols['Solution Stack Name'],
-                        'Platform Branch State': platform_cols['Platform Branch State'],
-                    })
-
-            except Exception as e:
-                utils.log_warning(f"Could not get template {template_name} for application {app_name}: {str(e)}")
+            except (ClientError, BotoCoreError) as e:
+                code, error_text = error_code_and_text(e)
+                utils.log_warning(
+                    f"Could not get template {template_name} for application {app_name}: {code}: {error_text}"
+                )
+                unavailable = f"Unavailable ({code})"
+                templates.append(_template_row(
+                    region, app_name, template_name,
+                    unavailable_platform_columns(region, code, error_text),
+                    unavailable, unavailable, unavailable, unavailable,
+                    error_text,
+                ))
                 continue
+
+            config_settings = template_response.get('ConfigurationSettings', [])
+            if not config_settings:
+                # Listed but no settings returned: still a row, never a silent drop.
+                note = "DescribeConfigurationSettings returned no settings for this template"
+                templates.append(_template_row(
+                    region, app_name, template_name,
+                    unavailable_platform_columns(region, 'NoSettingsReturned', ''),
+                    'Unavailable (NoSettingsReturned)', 'Unavailable (NoSettingsReturned)',
+                    'Unavailable (NoSettingsReturned)', 'Unavailable (NoSettingsReturned)',
+                    note,
+                ))
+                continue
+
+            for config in config_settings:
+                platform_cols = platform_columns(
+                    region, config.get('PlatformArn', 'N/A'), config.get('SolutionStackName', 'N/A')
+                )
+                templates.append(_template_row(
+                    region, app_name, template_name, platform_cols,
+                    config.get('DeploymentStatus', 'N/A'),
+                    config.get('Description', 'N/A'),
+                    _format_date(config.get('DateCreated')),
+                    _format_date(config.get('DateUpdated')),
+                    '',
+                ))
 
     return templates
 
 
-def collect_configuration_templates(regions: list[str]) -> list[dict[str, Any]]:
-    """Collect Elastic Beanstalk configuration template information using concurrent scanning."""
-    print("\n=== COLLECTING ELASTIC BEANSTALK CONFIGURATION TEMPLATES ===")
-    utils.log_info(f"Scanning {len(regions)} regions...")
-
-    region_results = utils.scan_regions_concurrent(
-        regions=regions,
-        scan_function=collect_configuration_templates_from_region,
-        show_progress=True
-    )
-
-    all_templates = []
-    for templates_in_region in region_results:
-        all_templates.extend(templates_in_region)
-
-    utils.log_success(f"Total configuration templates collected: {len(all_templates)}")
-    return all_templates
+def collect_configuration_templates(regions: list[str]) -> tuple[list[dict[str, Any]], list]:
+    """Collect Elastic Beanstalk configuration templates; returns ``(rows, failed_scopes)``."""
+    return _scan_scope(regions, collect_configuration_templates_from_region, 'configuration templates')
 
 
 def generate_summary(applications: list[dict[str, Any]],
@@ -566,6 +661,26 @@ def generate_summary(applications: list[dict[str, Any]],
         'Metric': 'Total Configuration Templates',
         'Count': len(templates),
         'Details': f"{len(templates)} saved configurations"
+    })
+
+    unreadable_apps = len([a for a in applications if a.get('Collection Note')])
+    summary.append({
+        'Metric': 'Unreadable Applications',
+        'Count': unreadable_apps,
+        'Details': (
+            f"{unreadable_apps} of {len(applications)} application rows could not be processed; "
+            "see Collection Note on the Applications sheet"
+        ),
+    })
+
+    unreadable = len([t for t in templates if t.get('Collection Note')])
+    summary.append({
+        'Metric': 'Unreadable Configuration Templates',
+        'Count': unreadable,
+        'Details': (
+            f"{unreadable} of {len(templates)} template rows could not be read; "
+            "see Collection Note on the Config Templates sheet"
+        ),
     })
 
     # Environment health distribution
@@ -637,18 +752,19 @@ def _run_export(account_id: str, account_name: str, regions: list[str]) -> list:
 
     Returns:
         list: ``failed_regions`` — ``(region, error_message)`` tuples for
-        regions whose Applications scope collection failed. The Summary
+        scopes (any collector) whose collection failed. The Summary
         sheet (and workbook) is always written regardless; the caller
         decides whether to also report a FAILED marker and exit non-zero.
     """
     # Collect data
     print("\n=== Collecting Elastic Beanstalk Data ===")
-    # Applications are the primary scope — region failures must propagate as
-    # failed_regions, never collapse into "empty".
+    # Region failures in any collector propagate as failed scopes, never
+    # collapse into "empty".
     applications, failed_regions = collect_applications(regions)
-    environments = collect_environments(regions)
-    versions = collect_application_versions(regions)
-    templates = collect_configuration_templates(regions)
+    environments, env_failed = collect_environments(regions)
+    versions, versions_failed = collect_application_versions(regions)
+    templates, templates_failed = collect_configuration_templates(regions)
+    failed_regions = list(failed_regions) + env_failed + versions_failed + templates_failed
 
     # Generate summary
     summary = generate_summary(applications, environments, versions, templates)
@@ -728,7 +844,7 @@ def main():
 
             elif step == 3:
                 failed_regions = _run_export(account_id, account_name, regions)
-                # If ANY region failed the Applications scope collection,
+                # If ANY region failed any collector scope,
                 # make it loud: write a marker and exit non-zero, even
                 # though a workbook was still written (the forced Summary
                 # sheet). A complete-looking file that hides a failed scope
