@@ -43,6 +43,9 @@ SERVICE_ALIASES: dict[str, str] = {
     "fargate": "AWS Fargate",
     "app runner": "AWS App Runner",
     "apprunner": "AWS App Runner",
+    "workspaces": "Amazon WorkSpaces",
+    "amazon workspaces": "Amazon WorkSpaces",
+    "workspaces personal": "Amazon WorkSpaces",
 
     # Storage
     "s3": "Amazon Simple Storage Service",
@@ -196,6 +199,7 @@ SERVICE_SCRIPT_MAP: dict[str, list[str]] = {
     "Amazon EC2 Auto Scaling": ["autoscaling_export.py"],
     "AWS Elastic Beanstalk": ["elasticbeanstalk_export.py"],
     "AWS App Runner": ["apprunner_export.py"],
+    "Amazon WorkSpaces": ["workspaces_export.py"],
 
     # Storage Services
     "Amazon Simple Storage Service": [
@@ -356,6 +360,7 @@ SCRIPT_CATEGORIES: dict[str, list[str]] = {
         "autoscaling_export.py",
         "elasticbeanstalk_export.py",
         "apprunner_export.py",
+        "workspaces_export.py",
         "compute_resources.py",
         "ec2_capacity_reservations_export.py",
         "ec2_dedicated_hosts_export.py",

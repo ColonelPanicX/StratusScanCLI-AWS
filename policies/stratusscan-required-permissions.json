@@ -19,7 +19,8 @@
         "elasticbeanstalk:Describe*",
         "elasticbeanstalk:List*",
         "lambda:Get*",
-        "lambda:List*"
+        "lambda:List*",
+        "workspaces:Describe*"
       ],
       "Resource": "*"
     },

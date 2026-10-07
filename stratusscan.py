@@ -459,7 +459,8 @@ def get_menu_structure():
                         "8": {"name": "EC2 Image Builder", "file": scripts_dir / "image_builder_export.py", "description": "Export Image Builder pipelines"},
                         "9": {"name": "EC2 Capacity Reservations", "file": scripts_dir / "ec2_capacity_reservations_export.py", "description": "Export EC2 Capacity Reservations"},
                         "10": {"name": "EC2 Dedicated Hosts", "file": scripts_dir / "ec2_dedicated_hosts_export.py", "description": "Export EC2 Dedicated Hosts"},
-                        "11": {"name": "All Compute Resources", "file": scripts_dir / "compute_resources.py", "description": "Export all compute resources in one report"},
+                        "11": {"name": "WorkSpaces", "file": scripts_dir / "workspaces_export.py", "description": "Export Amazon WorkSpaces (state, OS, running mode, connection)"},
+                        "12": {"name": "All Compute Resources", "file": scripts_dir / "compute_resources.py", "description": "Export all compute resources in one report"},
                     }
                 },
                 "2": {

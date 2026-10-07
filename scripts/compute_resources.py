@@ -8,7 +8,7 @@ execution, zip archiving, summary) to the shared engine.
 
 Covered services (multi-select at runtime):
   EC2, EKS, ECS, Auto Scaling Groups, Lambda Functions, ECR, AMI,
-  EC2 Image Builder, EC2 Capacity Reservations, EC2 Dedicated Hosts
+  EC2 Image Builder, EC2 Capacity Reservations, EC2 Dedicated Hosts, WorkSpaces
 """
 
 import sys
@@ -33,6 +33,7 @@ SCRIPTS = [
     ("EC2 Image Builder",         "image_builder_export.py"),
     ("EC2 Capacity Reservations", "ec2_capacity_reservations_export.py"),
     ("EC2 Dedicated Hosts",       "ec2_dedicated_hosts_export.py"),
+    ("WorkSpaces",                "workspaces_export.py"),
 ]
 
 

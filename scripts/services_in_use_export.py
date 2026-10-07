@@ -177,6 +177,12 @@ SERVICE_CHECKS = {
             'unit': 'databases',
             'regional': True
         },
+        'Amazon WorkSpaces': {
+            'client': 'workspaces',
+            'check': lambda c, r: _count_paginated(c, 'describe_workspaces', 'Workspaces'),
+            'unit': 'workspaces',
+            'regional': True
+        },
         'AWS Lambda': {
             'client': 'lambda',
             'check': lambda c, r: sum(
