@@ -8,7 +8,7 @@ environments, application versions, and configuration settings.
 
 Features:
 - Applications: Beanstalk application containers
-- Environments: Application environments with platform info and health
+- Environments: Application environments with platform branch/version, lifecycle state and health
 - Application Versions: Deployable application versions and source bundles
 - Configuration Templates: Saved environment configurations
 - Phase 4B: Concurrent region scanning (4x-10x performance improvement)
@@ -18,8 +18,11 @@ Output: Excel file with 5 worksheets
 """
 
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 try:
     import utils
@@ -31,6 +34,102 @@ except ImportError:
         sys.path.append(str(script_dir))
     import utils
 args = utils.parse_script_args("Export Elastic Beanstalk applications and environments to Excel")
+
+NOT_AVAILABLE = 'N/A'
+STATE_NOT_FOUND = 'Not Found'
+_PLATFORM_ARN_MARKER = ':platform/'
+
+# Region -> (branch name -> LifecycleState, lookup error state or None).
+# ListPlatformBranches is called at most once per region per run; the
+# environment and configuration-template collectors share the result.
+_BRANCH_STATE_CACHE: dict[str, tuple[dict[str, str], Optional[str]]] = {}
+_BRANCH_STATE_LOCK = threading.Lock()
+
+
+def parse_platform_arn(platform_arn: str, solution_stack_name: str) -> dict[str, str]:
+    """
+    Split an Elastic Beanstalk PlatformArn into branch name and version.
+
+    ARN form: ``arn:aws:elasticbeanstalk:<region>:<acct>:platform/<Branch Name>/<version>``.
+    Branch names contain spaces and are never split on whitespace; only the
+    final ``/`` separates the version. Nothing is guessed: a missing or
+    unparseable ARN yields ``N/A`` for branch and version, and the ``Platform``
+    value falls back to the SolutionStackName (older environments) or ``N/A``.
+    """
+    branch = NOT_AVAILABLE
+    version = NOT_AVAILABLE
+    if platform_arn and platform_arn != NOT_AVAILABLE and _PLATFORM_ARN_MARKER in platform_arn:
+        resource = platform_arn.split(_PLATFORM_ARN_MARKER, 1)[1]
+        if '/' in resource:
+            parsed_branch, parsed_version = resource.rsplit('/', 1)
+            if parsed_branch and parsed_version:
+                branch, version = parsed_branch, parsed_version
+    platform = branch
+    if platform == NOT_AVAILABLE and solution_stack_name and solution_stack_name != NOT_AVAILABLE:
+        platform = solution_stack_name
+    return {
+        'Platform': platform,
+        'Platform Branch': branch,
+        'Platform Version': version,
+        'Platform ARN': platform_arn or NOT_AVAILABLE,
+        'Solution Stack Name': solution_stack_name or NOT_AVAILABLE,
+    }
+
+
+def _fetch_branch_states(region: str) -> tuple[dict[str, str], Optional[str]]:
+    """Call ListPlatformBranches (NextToken pagination; botocore has no paginator for it)."""
+    eb_client = utils.get_boto3_client('elasticbeanstalk', region_name=region)
+    states: dict[str, str] = {}
+    token = None
+    try:
+        while True:
+            kwargs = {'NextToken': token} if token else {}
+            response = eb_client.list_platform_branches(**kwargs)
+            for branch in response.get('PlatformBranchSummaryList', []):
+                name = branch.get('BranchName')
+                if name:
+                    states[name] = str(branch.get('LifecycleState', '')).capitalize() or NOT_AVAILABLE
+            token = response.get('NextToken')
+            if not token:
+                break
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'Unknown')
+        utils.log_warning(f"ListPlatformBranches failed in {region}: {code}")
+        return {}, f"Lookup Failed ({code})"
+    except BotoCoreError as e:
+        utils.log_warning(f"ListPlatformBranches failed in {region}: {type(e).__name__}")
+        return {}, f"Lookup Failed ({type(e).__name__})"
+    return states, None
+
+
+def get_branch_states(region: str) -> tuple[dict[str, str], Optional[str]]:
+    """Return the cached (states, error) for a region, fetching once on first use."""
+    with _BRANCH_STATE_LOCK:
+        if region not in _BRANCH_STATE_CACHE:
+            _BRANCH_STATE_CACHE[region] = _fetch_branch_states(region)
+        return _BRANCH_STATE_CACHE[region]
+
+
+def platform_columns(region: str, platform_arn: str, solution_stack_name: str) -> dict[str, str]:
+    """
+    Build the Platform column set for one row, including lifecycle state.
+
+    Lifecycle is only looked up when a branch was parsed from an ARN. A row
+    with no ARN gets ``N/A`` (the SolutionStackName is not a branch name, so
+    matching it would be a guess).
+    """
+    cols = parse_platform_arn(platform_arn, solution_stack_name)
+    branch = cols['Platform Branch']
+    if branch == NOT_AVAILABLE:
+        cols['Platform Branch State'] = NOT_AVAILABLE
+        return cols
+    states, error = get_branch_states(region)
+    if error:
+        cols['Platform Branch State'] = error
+    else:
+        cols['Platform Branch State'] = states.get(branch, STATE_NOT_FOUND)
+    return cols
+
 
 def _build_application_row(app: dict, region: str) -> dict[str, Any]:
     """Build a single Elastic Beanstalk application export row from a describe response."""
@@ -173,10 +272,7 @@ def collect_environments_from_region(region: str) -> list[dict[str, Any]]:
         platform_arn = env.get('PlatformArn', 'N/A')
         solution_stack_name = env.get('SolutionStackName', 'N/A')
 
-        # Extract platform name
-        platform_name = solution_stack_name if solution_stack_name != 'N/A' else 'N/A'
-        if platform_arn != 'N/A' and '/' in platform_arn:
-            platform_name = platform_arn.split('/')[-1]
+        platform_cols = platform_columns(region, platform_arn, solution_stack_name)
 
         # Tier (WebServer or Worker)
         tier = env.get('Tier', {})
@@ -224,7 +320,7 @@ def collect_environments_from_region(region: str) -> list[dict[str, Any]]:
             'Status': status,
             'Health': health,
             'Health Status': health_status,
-            'Platform': platform_name,
+            'Platform': platform_cols['Platform'],
             'Tier Name': tier_name,
             'Tier Type': tier_type,
             'Endpoint URL': endpoint_url,
@@ -237,6 +333,12 @@ def collect_environments_from_region(region: str) -> list[dict[str, Any]]:
             'Description': description,
             'Created': date_created_str,
             'Updated': date_updated_str,
+            # Appended at the end: consumers key on column positions.
+            'Platform Branch': platform_cols['Platform Branch'],
+            'Platform Version': platform_cols['Platform Version'],
+            'Platform ARN': platform_cols['Platform ARN'],
+            'Solution Stack Name': platform_cols['Solution Stack Name'],
+            'Platform Branch State': platform_cols['Platform Branch State'],
         })
 
     return environments
@@ -389,20 +491,23 @@ def collect_configuration_templates_from_region(region: str) -> list[dict[str, A
                     else:
                         date_updated_str = 'N/A'
 
-                    # Extract platform name
-                    platform_name = solution_stack_name if solution_stack_name != 'N/A' else 'N/A'
-                    if platform_arn != 'N/A' and '/' in platform_arn:
-                        platform_name = platform_arn.split('/')[-1]
+                    platform_cols = platform_columns(region, platform_arn, solution_stack_name)
 
                     templates.append({
                         'Region': region,
                         'Application': app_name,
                         'Template Name': template_name,
-                        'Platform': platform_name,
+                        'Platform': platform_cols['Platform'],
                         'Deployment Status': deployment_status,
                         'Description': description,
                         'Created': date_created_str,
                         'Updated': date_updated_str,
+                        # Appended at the end: consumers key on column positions.
+                        'Platform Branch': platform_cols['Platform Branch'],
+                        'Platform Version': platform_cols['Platform Version'],
+                        'Platform ARN': platform_cols['Platform ARN'],
+                        'Solution Stack Name': platform_cols['Solution Stack Name'],
+                        'Platform Branch State': platform_cols['Platform Branch State'],
                     })
 
             except Exception as e:
@@ -495,13 +600,11 @@ def generate_summary(applications: list[dict[str, Any]],
     if environments:
         platforms = {}
         for env in environments:
-            platform = env['Platform']
-            # Simplify platform name
-            if 'running' in platform.lower():
-                platform_short = platform.split('running')[1].strip().split()[0] if len(platform.split('running')) > 1 else platform
-            else:
-                platform_short = platform.split()[0] if platform != 'N/A' else 'N/A'
-            platforms[platform_short] = platforms.get(platform_short, 0) + 1
+            # Group by branch; rows without a PlatformArn fall back to their
+            # Platform value (SolutionStackName or N/A) rather than a guess.
+            branch = env.get('Platform Branch', 'N/A')
+            platform_key = branch if branch != 'N/A' else env['Platform']
+            platforms[platform_key] = platforms.get(platform_key, 0) + 1
 
         top_platforms = sorted(platforms.items(), key=lambda x: x[1], reverse=True)[:5]
         platform_details = ', '.join([f"{plat}: {count}" for plat, count in top_platforms])
