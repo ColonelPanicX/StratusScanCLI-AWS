@@ -116,9 +116,22 @@ def map_power_state(state: str | None) -> str:
     return f"Not determinable from State ({state})"
 
 
-def _fmt_ts(value: Any) -> Any:
-    """Timestamps are tz-aware datetimes from boto3; keep as-is, N/A when absent."""
-    return value if value else 'N/A'
+def _fmt_ts(value: Any) -> str:
+    """
+    Format a boto3 timestamp as ``YYYY-MM-DD HH:MM:SS UTC``; 'N/A' when absent.
+
+    boto3 returns tz-aware datetimes. They must not reach the DataFrame raw:
+    utils.prepare_dataframe_for_export only samples the first non-null value of
+    an object column, so a leading 'N/A' hides later tz-aware values from its
+    tz-stripping and Excel rejects the save (Issue #310). Strings are immune.
+    """
+    if not value:
+        return 'N/A'
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(datetime.timezone.utc)
+        return value.strftime('%Y-%m-%d %H:%M:%S UTC')
+    return str(value)
 
 
 # ---------------------------------------------------------------------------

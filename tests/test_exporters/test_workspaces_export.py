@@ -14,6 +14,8 @@ clients, and the failure paths with injected errors. moto cannot catch an
 unread-page bug, so the fake-client tests are the real pagination proof.
 """
 
+import datetime
+import logging
 import sys
 from pathlib import Path
 
@@ -21,6 +23,7 @@ import boto3
 import botocore.exceptions
 import pytest
 from moto import mock_aws
+from openpyxl import load_workbook
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 import workspaces_export  # noqa: E402
@@ -32,6 +35,11 @@ from workspaces_export import (  # noqa: E402
 )
 
 REGION = "us-east-1"
+
+# boto3 returns tz-aware datetimes (tzlocal in practice); use a non-UTC offset
+# so the UTC conversion is actually exercised.
+LAST_CONN = datetime.datetime(2026, 10, 1, 8, 30, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=-4)))
+CHECKED = datetime.datetime(2026, 10, 7, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -131,8 +139,8 @@ def _ws(i, **over):
 
 def _full_client(workspaces, **kw):
     conns = {w['WorkspaceId']: {'WorkspaceId': w['WorkspaceId'], 'ConnectionState': 'CONNECTED',
-                                'LastKnownUserConnectionTimestamp': 'T1',
-                                'ConnectionStateCheckTimestamp': 'T2'} for w in workspaces}
+                                'LastKnownUserConnectionTimestamp': LAST_CONN,
+                                'ConnectionStateCheckTimestamp': CHECKED} for w in workspaces}
     return _FakeClient(
         workspaces=workspaces,
         connections=conns,
@@ -223,7 +231,8 @@ class TestRows:
         assert row['Running Mode'] == 'AUTO_STOP'
         assert row['Auto-Stop Timeout (min)'] == 60
         assert row['Connection State'] == 'CONNECTED'
-        assert row['Last Known User Connection'] == 'T1'
+        assert row['Last Known User Connection'] == '2026-10-01 12:30:00 UTC'
+        assert row['Connection State Checked'] == '2026-10-07 12:00:00 UTC'
         assert row['Operating System'] == 'WINDOWS_10'
         assert row['Compute Type'] == 'STANDARD'
         assert row['Root Volume (GiB)'] == 80
@@ -626,3 +635,90 @@ class TestUnsupportedRegions:
 
         assert exc.value.code == 1
         assert [r for r, _ in capture.failures[2]] == [failing], "unsupported region must not be marked failed"
+
+
+# ---------------------------------------------------------------------------
+# Issue #310: tz-aware datetimes mixed with N/A must survive a REAL save.
+# Earlier tests used string timestamps and a faked save helper, so the real
+# writer was never exercised.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def real_out_dir(tmp_path, monkeypatch):
+    d = tmp_path / "output"
+    d.mkdir()
+    monkeypatch.setattr(workspaces_export.utils, "logger", logging.getLogger("test-workspaces"))
+    monkeypatch.setattr(workspaces_export.utils, "get_output_dir", lambda: d)
+    monkeypatch.setattr(workspaces_export.utils, "deliver_output", lambda p: p)
+    return d
+
+
+class TestFmtTs:
+    def test_aware_datetime_converted_to_utc_string(self):
+        assert workspaces_export._fmt_ts(LAST_CONN) == '2026-10-01 12:30:00 UTC'
+
+    def test_naive_datetime_formatted_as_is(self):
+        assert workspaces_export._fmt_ts(datetime.datetime(2026, 1, 2, 3, 4, 5)) == '2026-01-02 03:04:05 UTC'
+
+    @pytest.mark.parametrize("empty", [None, '', 0])
+    def test_absent_is_na(self, empty):
+        assert workspaces_export._fmt_ts(empty) == 'N/A'
+
+    def test_no_row_value_is_a_datetime(self, monkeypatch):
+        _use(monkeypatch, _full_client([_ws(1)]))
+        row = _scan_region(REGION)['rows'][0]
+        assert not any(isinstance(v, datetime.datetime) for v in row.values())
+
+
+class TestRealWorkbook:
+    def _mixed_client(self):
+        """First WorkSpace never connected (N/A leads the column), later ones have datetimes."""
+        workspaces = [_ws(1, State='STOPPED'), _ws(2), _ws(3)]
+        client = _full_client(workspaces)
+        client.connections.pop('ws-000000001')  # absent from the API -> not a datetime
+        client.connections['ws-000000002'].pop('LastKnownUserConnectionTimestamp')  # never connected
+        return client
+
+    def test_mixed_na_and_aware_datetimes_write_and_reread(self, monkeypatch, real_out_dir):
+        _use(monkeypatch, self._mixed_client())
+
+        workspaces_export._run_export('111122223333', 'ACME', [REGION], None, 'all')
+
+        files = list(real_out_dir.glob('*.xlsx'))
+        assert len(files) == 1, "export must produce a workbook (Issue #310)"
+        wb = load_workbook(files[0])
+        assert wb.sheetnames == ['Summary', 'WorkSpaces', 'Collection Warnings']
+
+        ws = wb['WorkSpaces']
+        header = [c.value for c in ws[1]]
+        last_i = header.index('Last Known User Connection')
+        chk_i = header.index('Connection State Checked')
+        id_i = header.index('WorkSpace ID')
+        by_id = {r[id_i]: r for r in ws.iter_rows(min_row=2, values_only=True)}
+
+        assert by_id['ws-000000001'][last_i] == 'N/A'
+        assert by_id['ws-000000002'][last_i] == 'N/A'
+        assert by_id['ws-000000003'][last_i] == '2026-10-01 12:30:00 UTC'
+        assert by_id['ws-000000003'][chk_i] == '2026-10-07 12:00:00 UTC'
+
+    def test_all_three_sheets_roundtrip_with_content(self, monkeypatch, real_out_dir):
+        # Enrichment failure guarantees a non-empty Collection Warnings sheet.
+        client = self._mixed_client()
+        client.errors['describe_workspace_bundles'] = _client_error('AccessDeniedException', 'DescribeWorkspaceBundles')
+        _use(monkeypatch, client)
+
+        workspaces_export._run_export('111122223333', 'ACME', [REGION], None, 'all')
+
+        wb = load_workbook(next(real_out_dir.glob('*.xlsx')))
+        summary = {(r[0], r[1]): r[2] for r in wb['Summary'].iter_rows(min_row=2, values_only=True)}
+        assert summary[('Totals', 'Total WorkSpaces')] == 3
+        assert summary[('By State', 'STOPPED')] == 1
+        assert wb['WorkSpaces'].max_row == 4  # header + 3
+        warn_rows = list(wb['Collection Warnings'].iter_rows(min_row=2, values_only=True))
+        assert any('DescribeWorkspaceBundles failed' in r[1] for r in warn_rows)
+
+    def test_empty_warnings_sheet_still_writes(self, monkeypatch, real_out_dir):
+        _use(monkeypatch, _full_client([_ws(1)]))
+        workspaces_export._run_export('111122223333', 'ACME', [REGION], None, 'all')
+        wb = load_workbook(next(real_out_dir.glob('*.xlsx')))
+        assert 'Collection Warnings' in wb.sheetnames
